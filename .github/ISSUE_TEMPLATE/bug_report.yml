@@ -1,0 +1,39 @@
+name: Problem report
+description: Something doesn't work or sounds wrong
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What you expected, and what you heard or saw instead.
+    validations:
+      required: true
+  - type: input
+    id: setup
+    attributes:
+      label: Your setup
+      description: Windows version, microphone model and the app you were using (for example Discord).
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Hush version
+      description: Shown on Hush's About page.
+    validations:
+      required: true
+  - type: textarea
+    id: status
+    attributes:
+      label: Output of hush-setup status
+      description: 'Run in a terminal: & "$env:ProgramFiles\Hush\hush-setup.exe" status'
+      render: text
+  - type: textarea
+    id: events
+    attributes:
+      label: Hush events from the Windows event log (if any)
+      description: 'Get-WinEvent -LogName Application -MaxEvents 500 | ? ProviderName -eq Hush | Select TimeCreated, Message'
+      render: text
+  - type: markdown
+    attributes:
+      value: Please don't attach recordings of your voice unless you're happy for anyone to hear them.

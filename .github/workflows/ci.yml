@@ -1,0 +1,18 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build application and APO payloads
+        run: cargo build --release
+      - name: Build release workspace
+        run: cargo build --workspace --release
+      - name: Test workspace
+        run: cargo test --workspace --exclude hush-installer --all-targets

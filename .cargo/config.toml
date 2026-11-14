@@ -1,0 +1,4 @@
+# Link the C runtime statically so hush_apo.dll (loaded by audiodg.exe)
+# and the executables do not depend on a Visual C++ redistributable.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

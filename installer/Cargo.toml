@@ -1,0 +1,22 @@
+﻿[package]
+name = "hush-installer"
+version = "1.0.0"
+edition = "2021"
+description = "Hush installer"
+authors = ["Exel (https://exel.dev)"]
+license = "MIT"
+publish = false
+build = "build.rs"
+
+[[bin]]
+# Not "Hush-Setup": Windows file names are case-insensitive and that
+# would overwrite hush-setup.exe (the setup tool) in target/release.
+name = "hush-installer"
+path = "src/main.rs"
+
+[target.'cfg(windows)'.dependencies]
+eframe = { version = "0.37.0", default-features = false, features = ["accesskit", "default_fonts", "glow"] }
+winreg = "0.55"
+
+[build-dependencies]
+winresource = "0.1"
