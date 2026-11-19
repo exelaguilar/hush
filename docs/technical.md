@@ -111,8 +111,36 @@ Requires Rust (stable, MSVC toolchain) on Windows.
 ```powershell
 cargo build --workspace --release
 cargo test --workspace --exclude hush-installer --all-targets
-powershell -ExecutionPolicy Bypass -File .\package.ps1   # -> dist\Hush-Setup-<version>.exe
+powershell -ExecutionPolicy Bypass -File .\package.ps1   # -> dist\Hush-Setup-<version>.exe and .sha256
 ```
+
+The installer is one file. Its build script (`installer/build.rs`)
+brotli-compresses `hush.exe`, `hush-setup.exe` and `hush_apo.dll` from
+`SM_PAYLOAD_DIR` (default `target\release`) into `OUT_DIR`, each behind its
+original length. At install time the installer unpacks them in memory,
+checks every length, and only then touches the system. Run
+`cargo test -p hush-installer` for its codec tests, with `SM_PAYLOAD_DIR` set
+and `__COMPAT_LAYER=RunAsInvoker` (the installer manifest requires elevation
+and the test executable shares it).
+`package.ps1` sets `CARGO_PROFILE_RELEASE_BUILD_OVERRIDE_OPT_LEVEL=3` so the
+compression step is fast; set it yourself for a plain release build of the
+installer.
+
+`Hush-Setup.exe /S` (or `--silent`) installs with no window, and must run
+elevated. It attaches Clean Mic to the microphone Hush already uses (else
+the first physical one), keeps your saved settings, does not launch the app,
+and exits 0 on success (1 on failure). Details are logged to
+`%TEMP%\Hush-Setup.log`.
+
+Releases: push a `vX.Y.Z` tag that matches the version in `Cargo.toml`.
+`.github/workflows/release.yml` builds and tests on Windows, then creates the
+GitHub release with `Hush-Setup-X.Y.Z.exe`, its `.sha256`, and the matching
+`CHANGELOG.md` section as notes (an existing release keeps its notes).
+`.github/workflows/ci.yml` builds and tests every push and pull request.
+
+`packaging/winget/` holds the winget manifest templates (`Exel.Hush`) and
+`update-manifests.ps1 -Version X.Y.Z`, which fills them from the release hash.
+Its README covers submitting them to winget-pkgs.
 
 `hush-setup.exe` manages the plugin directly:
 

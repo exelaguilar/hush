@@ -1,10 +1,13 @@
 //! Windows toast notifications for an unpackaged app.
 //!
 //! Toasts need an AppUserModelId registered under HKCU; we write one named
-//! `Exel.Hush` with a display name and a PNG icon. Failures are ignored on
-//! purpose: the in-app banner always shows the same information.
+//! `Exel.Hush` with a display name and a PNG icon. Clicking a toast opens the
+//! Hush window through a per-user `hush:` URL protocol that runs
+//! `hush.exe --show` (the normal second-launch path). Only the installed copy
+//! registers the protocol, so a dev build never takes it over. Failures are
+//! ignored on purpose: the in-app banner always shows the same information.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use windows::{
     core::HSTRING,
     Data::Xml::Dom::XmlDocument,
@@ -14,6 +17,49 @@ use windows::{
 use winreg::{enums::HKEY_CURRENT_USER, RegKey};
 
 const AUMID: &str = "Exel.Hush";
+const PROTOCOL_KEY: &str = r"Software\Classes\hush";
+/// Argument the protocol handler starts Hush with.
+pub const SHOW_FLAG: &str = "--show";
+
+/// Whether this exe runs from %ProgramFiles%\Hush (the installed copy).
+fn running_installed() -> bool {
+    let (Ok(exe), Some(program_files)) = (std::env::current_exe(), std::env::var_os("ProgramFiles"))
+    else {
+        return false;
+    };
+    exe.parent()
+        .is_some_and(|dir| same_path(dir, &PathBuf::from(program_files).join("Hush")))
+}
+
+fn same_path(a: &Path, b: &Path) -> bool {
+    let norm = |p: &Path| {
+        p.to_string_lossy()
+            .trim_start_matches(r"\\?\")
+            .trim_end_matches('\\')
+            .to_lowercase()
+    };
+    norm(a) == norm(b)
+}
+
+fn register_protocol() {
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let Ok((key, _)) = RegKey::predef(HKEY_CURRENT_USER).create_subkey(PROTOCOL_KEY) else {
+        return;
+    };
+    let _ = key.set_value("", &String::from("URL:Hush"));
+    let _ = key.set_value("URL Protocol", &String::new());
+    if let Ok((command, _)) = key.create_subkey(r"shell\open\command") {
+        let _ = command.set_value("", &format!("\"{}\" {SHOW_FLAG}", exe.display()));
+    }
+}
+
+fn protocol_registered() -> bool {
+    RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey(PROTOCOL_KEY)
+        .is_ok()
+}
 
 fn icon_path() -> PathBuf {
     std::env::var_os("APPDATA")
@@ -37,11 +83,14 @@ pub fn register() {
         let _ = key.set_value("DisplayName", &String::from("Hush"));
         let _ = key.set_value("IconUri", &icon.display().to_string());
     }
+    if running_installed() {
+        register_protocol();
+    }
 }
 
 /// Shows a toast with a title and one line of text, without blocking.
 pub fn show(title: &str, text: &str) {
-    let xml = toast_xml(title, text);
+    let xml = toast_xml(title, text, protocol_registered());
     let _ = std::thread::Builder::new()
         .name("hush-toast".into())
         .spawn(move || {
@@ -75,9 +124,15 @@ fn escape(text: &str) -> String {
     out
 }
 
-fn toast_xml(title: &str, text: &str) -> String {
+/// With `activate`, clicking the toast opens `hush:open` (shows the window).
+fn toast_xml(title: &str, text: &str, activate: bool) -> String {
+    let root = if activate {
+        "<toast launch=\"hush:open\" activationType=\"protocol\">"
+    } else {
+        "<toast>"
+    };
     format!(
-        "<toast><visual><binding template=\"ToastGeneric\"><text>{}</text><text>{}</text></binding></visual></toast>",
+        "{root}<visual><binding template=\"ToastGeneric\"><text>{}</text><text>{}</text></binding></visual></toast>",
         escape(title),
         escape(text)
     )
@@ -152,9 +207,28 @@ mod tests {
 
     #[test]
     fn xml_is_escaped() {
-        let xml = toast_xml("A & B", "<Mic> \"x\"");
+        let xml = toast_xml("A & B", "<Mic> \"x\"", false);
         assert!(xml.contains("A &amp; B"));
         assert!(xml.contains("&lt;Mic&gt; &quot;x&quot;"));
+        assert!(xml.starts_with("<toast>"));
+    }
+
+    #[test]
+    fn toast_click_opens_hush() {
+        let xml = toast_xml("T", "x", true);
+        assert!(xml.starts_with("<toast launch=\"hush:open\" activationType=\"protocol\">"));
+    }
+
+    #[test]
+    fn installed_location_compares_loosely() {
+        assert!(same_path(
+            Path::new(r"\\?\C:\Program Files\Hush"),
+            Path::new(r"c:\program files\hush\")
+        ));
+        assert!(!same_path(
+            Path::new(r"C:\Users\me\target\debug"),
+            Path::new(r"C:\Program Files\Hush")
+        ));
     }
 
     #[test]

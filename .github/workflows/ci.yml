@@ -4,15 +4,49 @@ on:
   push:
   pull_request:
 
+# A newer push to the same ref supersedes the run in progress.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # The installer's build script compresses its payload; keep it fast.
+  CARGO_PROFILE_RELEASE_BUILD_OVERRIDE_OPT_LEVEL: "3"
+
 jobs:
   windows:
     runs-on: windows-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+
       - name: Build application and APO payloads
-        run: cargo build --release
-      - name: Build release workspace
-        run: cargo build --workspace --release
+        run: cargo build --release --workspace --exclude hush-installer
+
+      - name: Build installer
+        env:
+          SM_PAYLOAD_DIR: ${{ github.workspace }}\target\release
+        run: cargo build --release -p hush-installer
+
       - name: Test workspace
         run: cargo test --workspace --exclude hush-installer --all-targets
+
+      - name: Test installer
+        env:
+          SM_PAYLOAD_DIR: ${{ github.workspace }}\target\release
+          # The installer's manifest asks for elevation; the test exe must not.
+          __COMPAT_LAYER: RunAsInvoker
+        run: cargo test -p hush-installer
+
+      # Not blocking yet: see the warnings, fix them over time.
+      - name: Clippy
+        continue-on-error: true
+        run: cargo clippy --workspace --exclude hush-installer --all-targets

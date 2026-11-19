@@ -2,7 +2,10 @@
 //! hidden) through `request_repaint`.
 
 use crate::icon_art::render_icon_state;
-use std::{cell::Cell, sync::mpsc};
+use std::{
+    cell::{Cell, RefCell},
+    sync::mpsc,
+};
 use tray_icon::{
     menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem},
     MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent,
@@ -22,6 +25,8 @@ pub struct Tray {
     mute: CheckMenuItem,
     /// Whether the icon currently shows the active (teal) state.
     icon_active: Cell<bool>,
+    /// Last tooltip text sent to Windows (it is set from the UI loop).
+    tooltip: RefCell<String>,
     actions: mpsc::Receiver<TrayAction>,
 }
 
@@ -111,6 +116,7 @@ impl Tray {
             clean_mic,
             mute,
             icon_active: Cell::new(clean_mic_on && !muted),
+            tooltip: RefCell::new("Hush".into()),
             actions,
         })
     }
@@ -138,7 +144,11 @@ impl Tray {
         }
     }
 
+    /// Only talks to Windows when the text changed.
     pub fn set_tooltip(&self, text: &str) {
-        let _ = self._icon.set_tooltip(Some(text));
+        if *self.tooltip.borrow() != text {
+            *self.tooltip.borrow_mut() = text.to_string();
+            let _ = self._icon.set_tooltip(Some(text));
+        }
     }
 }

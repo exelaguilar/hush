@@ -1,0 +1,19 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.6.0.schema.json
+PackageIdentifier: Exel.Hush
+PackageVersion: {{VERSION}}
+PackageLocale: en-US
+Publisher: Exel
+PublisherUrl: https://github.com/exelaguilar
+PackageName: Hush
+PackageUrl: https://github.com/exelaguilar/hush
+License: MIT
+LicenseUrl: https://github.com/exelaguilar/hush/blob/v{{VERSION}}/LICENSE
+ShortDescription: Clean up your real microphone in every Windows app. Neural noise removal, voice gate and voice EQ inside Windows' audio engine. No virtual mic, no driver, no cloud.
+Tags:
+- microphone
+- noise-suppression
+- noise-cancellation
+- audio
+- voice
+ManifestType: defaultLocale
+ManifestVersion: 1.6.0

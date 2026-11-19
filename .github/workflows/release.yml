@@ -1,0 +1,110 @@
+name: Release
+
+# Push a tag such as v1.0.1 to build the installer and publish it.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_PROFILE_RELEASE_BUILD_OVERRIDE_OPT_LEVEL: "3"
+
+jobs:
+  release:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check the tag matches Cargo.toml
+        id: version
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          cargo_version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
+          if [ "$version" != "$cargo_version" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match Cargo.toml version $cargo_version"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Build application and APO payloads
+        run: cargo build --release --workspace --exclude hush-installer
+
+      - name: Build installer
+        env:
+          SM_PAYLOAD_DIR: ${{ github.workspace }}\target\release
+        run: cargo build --release -p hush-installer
+
+      - name: Test
+        env:
+          SM_PAYLOAD_DIR: ${{ github.workspace }}\target\release
+          __COMPAT_LAYER: RunAsInvoker
+        run: |
+          cargo test --workspace --exclude hush-installer --all-targets
+          cargo test -p hush-installer
+
+      - name: Package and checksum
+        id: package
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          mkdir -p dist
+          name="Hush-Setup-$VERSION.exe"
+          cp target/release/hush-installer.exe "dist/$name"
+          hash="$(sha256sum "dist/$name" | cut -d ' ' -f 1 | tr 'A-F' 'a-f')"
+          printf '%s  %s\n' "$hash" "$name" > "dist/Hush-Setup-$VERSION.sha256"
+          echo "hash=$hash" >> "$GITHUB_OUTPUT"
+          ls -l dist
+
+      - name: Release notes from CHANGELOG.md
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          HASH: ${{ steps.package.outputs.hash }}
+        run: |
+          # Take the "## <version>" section, stop at the next "## ", and join
+          # hard-wrapped continuation lines (two leading spaces) to their bullet.
+          awk -v ver="$VERSION" '
+            /^## / {
+              if (found) exit
+              title = substr($0, 4)
+              if (title == ver || index(title, ver " ") == 1 || index(title, ver " -") == 1) { found = 1 }
+              next
+            }
+            found { print }
+          ' CHANGELOG.md | sed 's/\r$//' | awk '
+            /^  +[^ ]/ && out != "" { sub(/^ +/, ""); out = out " " $0; next }
+            { if (started) print out; out = $0; started = 1 }
+            END { if (started) print out }
+          ' | cat -s > notes.md
+          if ! grep -q '[^[:space:]]' notes.md; then
+            echo "No CHANGELOG.md section found for $VERSION" > notes.md
+          fi
+          printf '\nSHA-256: `%s  Hush-Setup-%s.exe`\n' "$HASH" "$VERSION" >> notes.md
+          cat notes.md
+
+      - name: Create or update the GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          files=("dist/Hush-Setup-$VERSION.exe" "dist/Hush-Setup-$VERSION.sha256")
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            # Keep any notes already on the release.
+            gh release upload "$GITHUB_REF_NAME" "${files[@]}" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" "${files[@]}" \
+              --title "Hush $VERSION" --notes-file notes.md --verify-tag
+          fi

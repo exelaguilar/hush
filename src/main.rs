@@ -5,7 +5,11 @@
 #[cfg(windows)]
 mod clipboard;
 #[cfg(windows)]
+mod dev;
+#[cfg(windows)]
 mod diagnostics;
+#[cfg(windows)]
+mod endpoints;
 #[cfg(windows)]
 mod health;
 #[cfg(windows)]
@@ -69,24 +73,6 @@ fn uninstall() {
     }
 }
 
-/// Window size; HUSH_SHOT_SIZE=820x760 and HUSH_SHOT_SCALE=1.5 are
-/// developer aids for README screenshots.
-#[cfg(windows)]
-fn shot_window_size() -> [f32; 2] {
-    let scale = std::env::var("HUSH_SHOT_SCALE")
-        .ok()
-        .and_then(|s| s.parse::<f32>().ok())
-        .unwrap_or(1.0);
-    let [w, h] = std::env::var("HUSH_SHOT_SIZE")
-        .ok()
-        .and_then(|s| {
-            let (w, h) = s.split_once('x')?;
-            Some([w.parse().ok()?, h.parse().ok()?])
-        })
-        .unwrap_or([820.0, 600.0]);
-    [w * scale, h * scale]
-}
-
 #[cfg(windows)]
 fn main() -> eframe::Result {
     // Windows "Installed apps" > Uninstall runs `hush.exe --uninstall`:
@@ -95,9 +81,11 @@ fn main() -> eframe::Result {
         uninstall();
         return Ok(());
     }
-    // Second launch: bring the running Hush to the front and exit.
-    // Developer aid: HUSH_SHOT runs beside an installed Hush.
-    let _instance = if std::env::var_os("HUSH_SHOT").is_some() {
+    // Second launch (Start menu, shortcut, or a clicked toast, which runs
+    // `hush.exe --show`): bring the running Hush to the front and exit. When
+    // none is running this one starts and shows its window.
+    // Developer aid (debug builds): HUSH_SHOT runs beside an installed Hush.
+    let _instance = if dev::shot_path().is_some() {
         None
     } else {
         let Some(instance) = instance::acquire() else {
@@ -105,7 +93,8 @@ fn main() -> eframe::Result {
         };
         Some(instance)
     };
-    let start_hidden = std::env::args().any(|arg| arg == prefs::MINIMIZED_FLAG);
+    let show = std::env::args().any(|arg| arg == notify::SHOW_FLAG || arg.starts_with("hush:"));
+    let start_hidden = !show && std::env::args().any(|arg| arg == prefs::MINIMIZED_FLAG);
     let icon = eframe::egui::IconData {
         rgba: icon_art::render_icon(64),
         width: 64,
@@ -114,7 +103,7 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("Hush")
-            .with_inner_size(shot_window_size())
+            .with_inner_size(dev::window_size())
             .with_min_inner_size([680.0, 480.0])
             .with_icon(icon)
             .with_visible(!start_hidden),

@@ -1,6 +1,6 @@
 ﻿[package]
 name = "hush-installer"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2021"
 description = "Hush installer"
 authors = ["Exel (https://exel.dev)"]
@@ -14,9 +14,14 @@ build = "build.rs"
 name = "hush-installer"
 path = "src/main.rs"
 
+[dependencies]
+# Pure-Rust decoder for the compressed payload (the encoder is only used by tests).
+brotli = { version = "8", default-features = false, features = ["std"] }
+
 [target.'cfg(windows)'.dependencies]
 eframe = { version = "0.37.0", default-features = false, features = ["accesskit", "default_fonts", "glow"] }
 winreg = "0.55"
 
 [build-dependencies]
+brotli = { version = "8", default-features = false, features = ["std"] }
 winresource = "0.1"

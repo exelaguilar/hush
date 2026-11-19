@@ -10,7 +10,7 @@
 //! `hush-setup`, started with `schtasks /run`. Nothing is repaired unless
 //! Hush decides it is needed, and never more than a few times per half hour.
 
-use crate::install_state;
+use crate::{endpoints, install_state};
 use hush_apo::settings;
 use std::{
     collections::{hash_map::DefaultHasher, VecDeque},
@@ -37,14 +37,6 @@ use windows::{
         },
     },
 };
-use winreg::{
-    enums::{HKEY_LOCAL_MACHINE, KEY_READ},
-    RegKey,
-};
-
-const MMDEVICES: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Capture";
-const FX: &str = "{d04e05a6-594b-4fb6-a80d-01af5eed7d1d}";
-
 pub const REPAIR_TASK: &str = r"\Hush\Repair Clean Mic";
 pub const RESTART_TASK: &str = r"\Hush\Restart Clean Mic";
 
@@ -70,6 +62,9 @@ pub struct Probe {
     pub same_name_active: bool,
     /// Hush's FX values are present on an active endpoint with that name.
     pub attached_to_active: bool,
+    /// "Audio enhancements" are switched off for the endpoint Hush is on, so
+    /// Windows skips every plugin there.
+    pub enhancements_off: bool,
     /// An app is actively capturing from that endpoint.
     pub capturing_here: bool,
     /// Identifies the set of capturing sessions (to notice changes).
@@ -107,6 +102,8 @@ pub enum Health {
     Bypassed,
     /// Automatic repair used up its attempts.
     Failing,
+    /// "Audio enhancements" are off in Windows, which skips Clean Mic.
+    EnhancementsOff,
     /// Informational: an app uses another microphone.
     WrongMic { app: String, other: String },
 }
@@ -124,6 +121,7 @@ impl Health {
             Health::Missing | Health::NotProcessing | Health::Bypassed | Health::Failing => {
                 "Clean Mic not processing"
             }
+            Health::EnhancementsOff => "Enhancements off",
             Health::WrongMic { .. } => "Other microphone in use",
         }
     }
@@ -144,6 +142,9 @@ impl Health {
                 "An app is recording from {mic} without Clean Mic. It may be asking Windows for raw, unprocessed audio."
             ),
             Health::Failing => "Automatic repair keeps failing.".into(),
+            Health::EnhancementsOff => {
+                format!("Audio enhancements are off for {mic}, so Windows skips Clean Mic.")
+            }
             Health::WrongMic { app, other } => format!("{app} is using {other}, not {mic}."),
         }
     }
@@ -172,6 +173,7 @@ pub enum Notice {
     Restored(String),
     Bypassed(String),
     Failing,
+    EnhancementsOff(String),
 }
 
 impl Notice {
@@ -193,6 +195,10 @@ impl Notice {
             Notice::Failing => (
                 "Automatic repair keeps failing".into(),
                 "Open Hush and choose Fix now.".into(),
+            ),
+            Notice::EnhancementsOff(mic) => (
+                "Audio enhancements are off".into(),
+                Health::EnhancementsOff.message(mic),
             ),
         }
     }
@@ -216,6 +222,7 @@ pub struct Monitor {
     bypass_key: Option<u64>,
     bypass_notified: bool,
     failing_notified: bool,
+    enhancements_notified: bool,
     restored_pending: Option<Instant>,
     wrong_since: Option<Instant>,
     last_notice: Vec<(&'static str, Instant)>,
@@ -329,7 +336,26 @@ impl Monitor {
             return step;
         }
 
-        // 3. Attached, an app records, but nothing is processed.
+        // 3. Windows skips every plugin while "Audio enhancements" are off.
+        // Nothing to repair: the user has to switch them on.
+        if probe.enhancements_off && snap.clean_mic_on {
+            step.health = Health::EnhancementsOff;
+            self.bypass_key = None;
+            self.bypass_notified = false;
+            self.restart_done_at = None;
+            if !self.enhancements_notified {
+                self.enhancements_notified = true;
+                step.notice = self.emit(
+                    "enhancements",
+                    Notice::EnhancementsOff(snap.mic.clone()),
+                    now,
+                );
+            }
+            return step;
+        }
+        self.enhancements_notified = false;
+
+        // 4. Attached, an app records, but nothing is processed.
         if self.bypass_key.is_some_and(|key| key != probe.capture_key) {
             self.bypass_key = None;
             self.bypass_notified = false;
@@ -382,7 +408,7 @@ impl Monitor {
             }
         }
 
-        // 4. Hint: an app records from a different microphone.
+        // 5. Hint: an app records from a different microphone.
         match (&probe.capture_other, probe.capturing_here) {
             (Some((app, other)), false) => {
                 let since = *self.wrong_since.get_or_insert(now);
@@ -401,64 +427,10 @@ impl Monitor {
 
 // -- System probes -----------------------------------------------------------------
 
-fn active_capture_endpoints() -> Vec<(String, String)> {
-    let Ok(root) = RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey_with_flags(MMDEVICES, KEY_READ)
-    else {
-        return Vec::new();
-    };
-    root.enum_keys()
-        .flatten()
-        .filter(|id| {
-            root.open_subkey_with_flags(id, KEY_READ)
-                .and_then(|key| key.get_value::<u32, _>("DeviceState"))
-                .is_ok_and(|state| state == 1)
-        })
-        .map(|id| {
-            let name = install_state::endpoint_name("Capture", &id).unwrap_or_else(|| id.clone());
-            (id, name)
-        })
-        .collect()
-}
-
-fn is_active(id: &str) -> bool {
-    RegKey::predef(HKEY_LOCAL_MACHINE)
-        .open_subkey_with_flags(format!(r"{MMDEVICES}\{id}"), KEY_READ)
-        .and_then(|key| key.get_value::<u32, _>("DeviceState"))
-        .is_ok_and(|state| state == 1)
-}
-
-/// Hush's FX value is present on this capture endpoint (needs no admin).
-fn has_fx(id: &str) -> bool {
-    let Ok(key) = RegKey::predef(HKEY_LOCAL_MACHINE)
-        .open_subkey_with_flags(format!(r"{MMDEVICES}\{id}\FxProperties"), KEY_READ)
-    else {
-        return false;
-    };
-    [1, 2, 7].into_iter().any(|slot| {
-        key.get_value::<String, _>(format!("{FX},{slot}"))
-            .is_ok_and(|v| v.eq_ignore_ascii_case(hush_apo::CLSID_STRING))
-    })
-}
-
-fn recorded_capture_ids() -> Vec<String> {
-    let record =
-        std::fs::read_to_string(settings::settings_dir().join("installed.txt")).unwrap_or_default();
-    let mut ids: Vec<String> = Vec::new();
-    for line in record.lines() {
-        let mut parts = line.split('\t');
-        if let (Some("Capture"), Some(id)) = (parts.next(), parts.next()) {
-            if !ids.iter().any(|known| known == id) {
-                ids.push(id.to_string());
-            }
-        }
-    }
-    ids
-}
-
 /// Active capture sessions on one endpoint: process ids.
 fn active_sessions(enumerator: &IMMDeviceEnumerator, id: &str) -> Vec<u32> {
     let mut pids = Vec::new();
-    let full: Vec<u16> = format!("{{0.0.1.00000000}}.{id}")
+    let full: Vec<u16> = endpoints::full_device_id(id)
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect();
@@ -519,26 +491,30 @@ fn process_name(pid: u32) -> String {
 
 fn probe(enumerator: &IMMDeviceEnumerator, mic: &str) -> Probe {
     let mut probe = Probe::default();
-    let name_matches = |name: &str| name.trim().eq_ignore_ascii_case(mic.trim());
-    probe.endpoint_active = recorded_capture_ids().iter().any(|id| {
-        let named = install_state::endpoint_name("Capture", id).unwrap_or_else(|| id.clone());
-        name_matches(&named) && is_active(id)
+    // One registry pass for the whole probe.
+    let all = endpoints::capture_endpoints();
+    let recorded = install_state::recorded_endpoints();
+    probe.endpoint_active = recorded.iter().any(|(flow, id)| {
+        flow == "Capture"
+            && all
+                .iter()
+                .any(|e| e.id == *id && e.active && endpoints::names_match(&e.name, mic))
     });
-    let endpoints = active_capture_endpoints();
-    let mut here: Vec<&String> = Vec::new();
-    for (id, name) in &endpoints {
-        if name_matches(name) {
-            here.push(id);
-        }
-    }
+    let active: Vec<&endpoints::Endpoint> = all.iter().filter(|e| e.active).collect();
+    let here: Vec<&&endpoints::Endpoint> = active
+        .iter()
+        .filter(|e| endpoints::names_match(&e.name, mic))
+        .collect();
     probe.same_name_active = !here.is_empty();
-    probe.attached_to_active = here.iter().any(|id| has_fx(id));
+    probe.attached_to_active = here.iter().any(|e| e.has_hush);
+    probe.enhancements_off = here.iter().any(|e| e.has_hush && e.enhancements_off);
 
     let own = std::process::id();
     let mut keys: Vec<u32> = Vec::new();
-    for (id, name) in &endpoints {
+    for endpoint in &active {
+        let (id, name) = (&endpoint.id, &endpoint.name);
         let pids = active_sessions(enumerator, id);
-        if name_matches(name) {
+        if endpoints::names_match(name, mic) {
             if !pids.is_empty() {
                 probe.capturing_here = true;
             }
@@ -882,6 +858,7 @@ mod tests {
                 endpoint_active: true,
                 same_name_active: true,
                 attached_to_active: true,
+                enhancements_off: false,
                 capturing_here: true,
                 capture_key: 1,
                 capture_other: None,
@@ -974,6 +951,29 @@ mod tests {
         changed.probe.capture_key = 2;
         let step = monitor.step(&changed, CFG, t0 + secs(401));
         assert_eq!(step.action, Some(ActionKind::Restart));
+    }
+
+    #[test]
+    fn enhancements_off_is_not_a_restart_or_bypass() {
+        let mut monitor = Monitor::default();
+        let t0 = Instant::now();
+        let mut snap = stale();
+        snap.probe.enhancements_off = true;
+        let step = monitor.step(&snap, CFG, t0);
+        assert_eq!(step.health, Health::EnhancementsOff);
+        assert_eq!(step.action, None);
+        assert_eq!(step.notice, Some(Notice::EnhancementsOff("Mic (USB)".into())));
+        assert!(step.health.needs_attention());
+        // Still no action, no second toast, and never "bypassed".
+        for later in [20, 70, 400] {
+            let step = monitor.step(&snap, CFG, t0 + secs(later));
+            assert_eq!(step.health, Health::EnhancementsOff);
+            assert_eq!((step.action, step.notice), (None, None));
+        }
+        // Turning enhancements back on resumes normal handling.
+        snap.probe.enhancements_off = false;
+        let step = monitor.step(&snap, CFG, t0 + secs(401));
+        assert_eq!(step.health, Health::NotProcessing);
     }
 
     #[test]

@@ -12,7 +12,7 @@ use std::{
         atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         OnceLock,
     },
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
 pub const FILE_NAME: &str = "mic.conf";
@@ -686,14 +686,36 @@ impl LiveWriter {
     }
 }
 
-/// Reader used by the app: maps `live.bin` once and reads it on demand.
+/// While the plugin runs, `updated_ms` changes many times per second. If it
+/// stays the same this long, the mapping may belong to a file that has since
+/// been replaced (uninstall and reinstall while the app runs), so it is
+/// opened again.
+const LIVE_REMAP_AFTER: Duration = Duration::from_secs(5);
+
+/// Reader used by the app: maps `live.bin` and reads it on demand. Remaps the
+/// file when it has stopped changing, at most once per `LIVE_REMAP_AFTER`.
 pub struct LiveReader {
+    path: PathBuf,
     map: Option<memmap2::Mmap>,
+    remap_after: Duration,
+    /// `updated_ms` of the last successful read and since when it is unchanged.
+    last_updated: Option<(u64, Instant)>,
+    last_remap: Instant,
 }
 
 impl LiveReader {
     pub fn new() -> Self {
-        Self { map: None }
+        Self::with_path(live_path(), LIVE_REMAP_AFTER)
+    }
+
+    fn with_path(path: PathBuf, remap_after: Duration) -> Self {
+        Self {
+            path,
+            map: None,
+            remap_after,
+            last_updated: None,
+            last_remap: Instant::now(),
+        }
     }
 
     fn get_u32(map: &memmap2::Mmap, offset: usize) -> u32 {
@@ -704,13 +726,32 @@ impl LiveReader {
     /// Latest levels, or `None` if the plugin has never run.
     pub fn read(&mut self) -> Option<LiveLevels> {
         if self.map.is_none() {
-            let file = std::fs::File::open(live_path()).ok()?;
+            let file = std::fs::File::open(&self.path).ok()?;
             if file.metadata().ok()?.len() < LIVE_SIZE {
                 return None;
             }
             self.map = unsafe { memmap2::Mmap::map(&file) }.ok();
+            self.last_remap = Instant::now();
         }
-        let map = self.map.as_ref()?;
+        let levels = Self::snapshot(self.map.as_ref()?);
+        if let Some(levels) = levels {
+            let now = Instant::now();
+            match &mut self.last_updated {
+                Some((ms, since)) if *ms == levels.updated_ms => {
+                    if now.saturating_duration_since(*since) >= self.remap_after
+                        && now.saturating_duration_since(self.last_remap) >= self.remap_after
+                    {
+                        // Reopen on the next read.
+                        self.map = None;
+                    }
+                }
+                other => *other = Some((levels.updated_ms, now)),
+            }
+        }
+        levels
+    }
+
+    fn snapshot(map: &memmap2::Mmap) -> Option<LiveLevels> {
         for _ in 0..4 {
             let before = Self::get_u32(map, 4);
             if before & 1 == 1 {
@@ -784,6 +825,34 @@ mod tests {
         assert_eq!(status.rate, 48_000);
         assert_eq!(status.channels, 2);
         assert!(parse_status("garbage").is_none());
+    }
+
+    #[test]
+    fn live_reader_remaps_a_file_that_stopped_changing() {
+        let path = std::env::temp_dir().join(format!("hush-live-test-{}.bin", std::process::id()));
+        let mut bytes = [0_u8; LIVE_SIZE as usize];
+        bytes[0..4].copy_from_slice(&LIVE_MAGIC.to_le_bytes());
+        bytes[24..32].copy_from_slice(&1234_u64.to_le_bytes());
+        std::fs::write(&path, bytes).unwrap();
+
+        // Zero wait: any unchanged read drops the mapping.
+        let mut reader = LiveReader::with_path(path.clone(), Duration::ZERO);
+        assert_eq!(reader.read().unwrap().updated_ms, 1234);
+        assert!(reader.map.is_some());
+        // Same timestamp again: the mapping is dropped...
+        assert_eq!(reader.read().unwrap().updated_ms, 1234);
+        assert!(reader.map.is_none());
+        // ...and the file is opened again on the next read (with a zero wait
+        // it is dropped again right after).
+        assert_eq!(reader.read().unwrap().updated_ms, 1234);
+
+        // With the normal wait a fresh mapping is kept.
+        let mut reader = LiveReader::with_path(path.clone(), LIVE_REMAP_AFTER);
+        reader.read().unwrap();
+        reader.read().unwrap();
+        assert!(reader.map.is_some());
+        drop(reader);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

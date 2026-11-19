@@ -1,5 +1,30 @@
 # Changelog
 
+## 1.0.1
+
+**Fixes**
+- If *Audio enhancements* are switched off for your microphone, Windows skips
+  Clean Mic entirely. Hush now says so, with a *Sound settings* button, instead
+  of restarting Windows audio and blaming an app.
+- The mute hotkey no longer falls back to another microphone when yours is not
+  plugged in. It says *Microphone not found.* instead.
+- The live meters recover when Clean Mic is reinstalled while Hush is running.
+- Mic Test: the level card is now *What others hear* and shows *Silent* in a
+  quiet room instead of -100 dB.
+- Light theme: clearer switches, slider rails, badges and warning text.
+
+**Notifications**
+- Clicking a notification opens Hush.
+
+**Lighter on your PC**
+- The mute state updates from Windows' own change notifications instead of
+  polling every second, the tray tooltip is only refreshed when it changes, and
+  Hush reads the install status less often.
+
+**Behind the scenes**
+- One shared microphone lookup, the window code split into smaller files, and
+  the screenshot and theme developer switches exist only in debug builds.
+
 ## 1.0.0
 
 **Clean Mic stays on**

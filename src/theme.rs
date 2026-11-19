@@ -17,6 +17,8 @@ pub struct Palette {
     pub sidebar: Color32,
     pub card: Color32,
     pub muted: Color32,
+    /// Empty part of a slider rail, meter or switch (visible on the card).
+    pub track: Color32,
     pub border: Color32,
     pub foreground: Color32,
     pub muted_foreground: Color32,
@@ -32,6 +34,7 @@ pub const DARK: Palette = Palette {
     sidebar: Color32::from_rgb(12, 12, 15),
     card: Color32::from_rgb(14, 14, 17),
     muted: Color32::from_rgb(39, 39, 42),
+    track: Color32::from_rgb(39, 39, 42),
     border: Color32::from_rgb(39, 39, 42),
     foreground: Color32::from_rgb(250, 250, 250),
     muted_foreground: Color32::from_rgb(161, 161, 170),
@@ -46,14 +49,15 @@ pub const LIGHT: Palette = Palette {
     background: Color32::from_rgb(255, 255, 255),
     sidebar: Color32::from_rgb(250, 250, 250),
     card: Color32::from_rgb(255, 255, 255),
-    muted: Color32::from_rgb(244, 244, 245),
+    muted: Color32::from_rgb(240, 240, 242),
+    track: Color32::from_rgb(212, 212, 216),
     border: Color32::from_rgb(228, 228, 231),
     foreground: Color32::from_rgb(9, 9, 11),
     muted_foreground: Color32::from_rgb(113, 113, 122),
     primary: TEAL_LIGHT_MODE,
     primary_foreground: Color32::WHITE,
     success: Color32::from_rgb(22, 163, 74),
-    warning: Color32::from_rgb(217, 119, 6),
+    warning: Color32::from_rgb(180, 83, 9),
     destructive: Color32::from_rgb(220, 38, 38),
 };
 
@@ -128,18 +132,18 @@ fn visuals_for(p: Palette, dark: bool) -> egui::Visuals {
     w.noninteractive.fg_stroke = Stroke::new(1.0, p.foreground);
     w.noninteractive.corner_radius = radius;
     // Outline-style controls at rest; slider rails use `bg_fill`.
-    w.inactive.bg_fill = p.muted;
+    w.inactive.bg_fill = p.track;
     w.inactive.weak_bg_fill = p.background;
     w.inactive.bg_stroke = Stroke::new(1.0, p.border);
     w.inactive.fg_stroke = Stroke::new(1.0, p.foreground);
     w.inactive.corner_radius = radius;
-    w.hovered.bg_fill = p.muted;
+    w.hovered.bg_fill = p.track;
     w.hovered.weak_bg_fill = p.muted;
     w.hovered.bg_stroke = Stroke::new(1.0, p.border);
     w.hovered.fg_stroke = Stroke::new(1.0, p.foreground);
     w.hovered.corner_radius = radius;
     w.hovered.expansion = 0.0;
-    w.active.bg_fill = p.muted;
+    w.active.bg_fill = p.track;
     w.active.weak_bg_fill = p.muted;
     w.active.bg_stroke = Stroke::new(1.0, p.primary);
     w.active.fg_stroke = Stroke::new(1.0, p.foreground);
@@ -285,7 +289,7 @@ pub fn switch(ui: &mut Ui, on: &mut bool, label: &str) -> Response {
     }
     let t = ui.ctx().animate_bool_responsive(response.id, *on);
     let enabled = ui.is_enabled();
-    let track = if *on { p.primary } else { p.muted };
+    let track = if *on { p.primary } else { p.track };
     let track = if enabled {
         track
     } else {

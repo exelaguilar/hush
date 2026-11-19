@@ -127,7 +127,7 @@ Hush wasn't thrown together. Every release went through the same process:
 - **No accidental changes.** Unchanged settings must reproduce the previous
   release's sound byte for byte, so a code change can't quietly change how
   you sound.
-- **83 automated tests** run on every push. Failure paths were tested by
+- **89 automated tests** run on every push. Failure paths were tested by
   deliberately crashing them: if processing ever fails, your mic keeps
   working unprocessed instead of taking Windows audio down with it.
 - **Used daily on real PCs** in Discord calls and games.
@@ -155,6 +155,7 @@ it on a different mic or PC? [Tell us how it went](../../issues/new/choose).
 | --- | --- |
 | Badge stays *Ready (mic idle)* during a call | The app is using a different microphone, or **Audio enhancements** are off for this one. |
 | Hush says *Not processing* after you replug a USB mic | Hush repairs this by itself within a few seconds. If it doesn't, click **Fix now** on the Microphone page. |
+| Hush says *Audio enhancements are off* | Windows skips every audio effect on that mic. Click **Sound settings**, open the microphone's properties and turn **Audio enhancements** on. |
 | Hush says an app is recording without Clean Mic | That app is asking Windows for raw audio. Turn off its "exclusive" or "raw" mic mode. |
 | Voice sounds processed twice or robotic | Turn off Discord's noise suppression, and Sonar ClearCast or NVIDIA Broadcast on the same mic. |
 | Soft words get cut | Raise gate **Sensitivity**, or set **Mic position** to **On the desk**. |

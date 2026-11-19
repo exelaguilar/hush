@@ -7,6 +7,102 @@
 #[cfg(not(windows))]
 fn main() {}
 
+/// The embedded payload: each file is brotli-compressed by build.rs behind
+/// an 8-byte little-endian header that holds the original length.
+#[cfg_attr(not(windows), allow(dead_code))]
+mod payload {
+    pub struct Blob(pub &'static [u8]);
+
+    impl Blob {
+        /// Original (uncompressed) size in bytes.
+        pub fn len(&self) -> usize {
+            decode_header(self.0).map_or(0, |(len, _)| len)
+        }
+
+        /// Decompresses the file, checking the result against the stored length.
+        pub fn unpack(&self) -> Result<Vec<u8>, String> {
+            unpack(self.0)
+        }
+    }
+
+    fn decode_header(blob: &[u8]) -> Option<(usize, &[u8])> {
+        let (head, body) = blob.split_first_chunk::<8>()?;
+        Some((usize::try_from(u64::from_le_bytes(*head)).ok()?, body))
+    }
+
+    pub fn unpack(blob: &[u8]) -> Result<Vec<u8>, String> {
+        let (len, body) = decode_header(blob).ok_or("installer payload is corrupt")?;
+        let mut out = Vec::with_capacity(len);
+        brotli::BrotliDecompress(&mut &body[..], &mut out)
+            .map_err(|e| format!("installer payload is corrupt: {e}"))?;
+        if out.len() != len {
+            return Err(format!(
+                "installer payload is corrupt (expected {len} bytes, got {})",
+                out.len()
+            ));
+        }
+        Ok(out)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::io::Write;
+
+        fn pack(data: &[u8]) -> Vec<u8> {
+            let mut out = (data.len() as u64).to_le_bytes().to_vec();
+            {
+                let mut w = brotli::CompressorWriter::new(&mut out, 4096, 5, 22);
+                w.write_all(data).unwrap();
+            }
+            out
+        }
+
+        #[test]
+        fn round_trips() {
+            let data: Vec<u8> = (0..100_000u32).map(|i| (i.wrapping_mul(i) >> 5) as u8).collect();
+            let packed = pack(&data);
+            assert!(packed.len() < data.len());
+            assert_eq!(super::unpack(&packed).unwrap(), data);
+            assert_eq!(super::unpack(&pack(b"")).unwrap(), b"");
+        }
+
+        #[test]
+        fn rejects_wrong_length_and_truncation() {
+            let mut packed = pack(b"hello hello hello hello");
+            packed[0] ^= 1;
+            assert!(super::unpack(&packed).is_err());
+            let packed = pack(&vec![7u8; 50_000]);
+            assert!(super::unpack(&packed[..packed.len() / 2]).is_err());
+            assert!(super::unpack(&[1, 2, 3]).is_err());
+        }
+
+        #[test]
+        fn embedded_payload_matches_headers() {
+            for blob in [
+                super::super::PAYLOAD_APP,
+                super::super::PAYLOAD_SETUP,
+                super::super::PAYLOAD_APO,
+            ] {
+                let blob = super::super::payload::Blob(blob);
+                assert_eq!(blob.unpack().unwrap().len(), blob.len());
+            }
+        }
+    }
+}
+
+const PAYLOAD_APP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/hush.exe.br"));
+const PAYLOAD_SETUP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/hush-setup.exe.br"));
+const PAYLOAD_APO: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/hush_apo.dll.br"));
+
+/// `--silent` (or `/S`): install without any window. Returns the process
+/// exit code. Windows only.
+#[cfg(windows)]
+fn silent_requested() -> bool {
+    std::env::args_os()
+        .skip(1)
+        .any(|a| a.eq_ignore_ascii_case("--silent") || a.eq_ignore_ascii_case("/S"))
+}
+
 #[cfg(windows)]
 #[path = "../../src/icon_art.rs"]
 mod icon_art;
@@ -17,6 +113,9 @@ mod theme;
 
 #[cfg(windows)]
 fn main() -> eframe::Result {
+    if silent_requested() {
+        std::process::exit(install::run_silent());
+    }
     let icon = eframe::egui::IconData {
         rgba: icon_art::render_icon(64),
         width: 64,
@@ -61,9 +160,10 @@ mod install {
     };
 
     const NO_WINDOW: u32 = 0x0800_0000;
-    pub const APP_EXE: &[u8] = include_bytes!(concat!(env!("SM_PAYLOAD_DIR"), "/hush.exe"));
-    pub const SETUP_EXE: &[u8] = include_bytes!(concat!(env!("SM_PAYLOAD_DIR"), "/hush-setup.exe"));
-    pub const APO_DLL: &[u8] = include_bytes!(concat!(env!("SM_PAYLOAD_DIR"), "/hush_apo.dll"));
+    use crate::payload::Blob;
+    const APP_EXE: Blob = Blob(crate::PAYLOAD_APP);
+    const SETUP_EXE: Blob = Blob(crate::PAYLOAD_SETUP);
+    const APO_DLL: Blob = Blob(crate::PAYLOAD_APO);
     pub const VERSION: &str = env!("CARGO_PKG_VERSION");
     /// Project page shown in Settings > Apps (empty until the repository
     /// URL in Cargo.toml is set).
@@ -306,6 +406,11 @@ mod install {
     /// and removable, but part of microphone setup could not finish.
     pub fn run(options: Options, log_to: Log) -> Outcome {
         let dir = program_dir().map_err(|e| e.to_string())?;
+        // Decompress everything first so a damaged installer fails before
+        // anything on this PC is touched.
+        let app_exe = APP_EXE.unpack()?;
+        let setup_exe = SETUP_EXE.unpack()?;
+        let apo_dll = APO_DLL.unpack()?;
         log(&log_to, "Closing Hush if it is running");
         let _ = system_tool("taskkill.exe").and_then(|mut command| {
             command
@@ -319,8 +424,8 @@ mod install {
 
         log(&log_to, format!("Copying files to {}", dir.display()));
         fs::create_dir_all(&dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
-        write_file(&dir.join("hush.exe"), APP_EXE).map_err(|e| format!("hush.exe: {e}"))?;
-        write_file(&dir.join("hush-setup.exe"), SETUP_EXE)
+        write_file(&dir.join("hush.exe"), &app_exe).map_err(|e| format!("hush.exe: {e}"))?;
+        write_file(&dir.join("hush-setup.exe"), &setup_exe)
             .map_err(|e| format!("hush-setup.exe: {e}"))?;
         // Both executables are available now. Register recovery before
         // installing the other files or touching audio endpoints.
@@ -342,9 +447,9 @@ mod install {
                 let staging = dir.join(format!(".setup-{}", std::process::id()));
                 fs::create_dir(&staging).map_err(|e| format!("Creating setup staging: {e}"))?;
                 let result = (|| {
-                    write_file(&staging.join("hush-setup.exe"), SETUP_EXE)
+                    write_file(&staging.join("hush-setup.exe"), &setup_exe)
                         .map_err(|e| e.to_string())?;
-                    write_file(&staging.join("hush_apo.dll"), APO_DLL)
+                    write_file(&staging.join("hush_apo.dll"), &apo_dll)
                         .map_err(|e| e.to_string())?;
                     run_logged(
                         &log_to,
@@ -365,9 +470,9 @@ mod install {
         // Clean Mic switch installs it from the program folder later.
         if attached.is_err() || options.microphone.is_none() {
             let target = dir.join("hush_apo.dll");
-            if write_file(&target, APO_DLL).is_err() {
+            if write_file(&target, &apo_dll).is_err() {
                 let written = audio(&log_to, false).and_then(|()| {
-                    write_file(&target, APO_DLL).map_err(|e| format!("hush_apo.dll: {e}"))
+                    write_file(&target, &apo_dll).map_err(|e| format!("hush_apo.dll: {e}"))
                 });
                 let restarted = audio(&log_to, true);
                 match (written, restarted) {
@@ -423,6 +528,33 @@ mod install {
         }
         log(&log_to, "Done");
         Ok(warning)
+    }
+
+    /// Unattended install for `--silent` / `/S` (winget, scripts): no window,
+    /// the microphone Hush is already attached to (else the first physical
+    /// one, if any), the same defaults the wizard offers, and the app is not
+    /// launched. Needs elevation (the manifest asks for it). Returns the
+    /// process exit code: 0 when Hush is installed (a microphone setup
+    /// warning still counts), 1 on failure. A log is written to
+    /// `%TEMP%\Hush-Setup.log`.
+    pub fn run_silent() -> i32 {
+        let options = Options {
+            microphone: microphones().into_iter().next().map(|mic| mic.id),
+            desk_mic: (!has_saved_mic_settings()).then_some(true),
+            start_with_windows: start_with_windows_default(),
+        };
+        let log_to: Log = Arc::new(Mutex::new(Vec::new()));
+        let outcome = run(options, log_to.clone());
+        let mut text = log_to.lock().unwrap().join("\r\n");
+        let code = match &outcome {
+            Ok(_) => 0,
+            Err(error) => {
+                text.push_str(&format!("\r\nFAILED: {error}"));
+                1
+            }
+        };
+        let _ = fs::write(std::env::temp_dir().join("Hush-Setup.log"), text);
+        code
     }
 
     fn register_uninstall(dir: &Path) -> Result<(), String> {

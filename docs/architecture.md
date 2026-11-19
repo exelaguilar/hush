@@ -22,12 +22,26 @@ The app and plugin share `%ProgramData%\Hush`:
 
 ## App modules (`src/`)
 
-- `ui.rs`: the window and its pages. `theme.rs`: shared widgets and colors.
+- `ui/`: the window. `mod.rs` holds the app state and the update loop,
+  `chrome.rs` the sidebar, header, health banner and the recording toast,
+  and `pages/` one file per page (Microphone, Noise & Gate, Voice, Mic Test,
+  Settings, About). `theme.rs`: shared widgets and colors (light and dark
+  palettes).
+- `endpoints.rs`: the one place that maps microphone friendly names to
+  capture endpoint ids (registry, read only): plugged in, Hush's FX value
+  present, and "Audio enhancements" switched off. `install_state.rs`,
+  `health.rs` and `mute.rs` all use it.
+- `dev.rs`: developer aids (`HUSH_SHOT`, `HUSH_PAGE`, `HUSH_THEME`, ...).
+  They exist only in debug builds; a release build never reads them.
 - `tray.rs`: tray icon and menu (Open Hush, Mic Test, Clean Mic, Mute microphone, Quit).
 - `mute.rs`: the optional global mute hotkey (`RegisterHotKey` on its own
   thread) and the Windows capture-endpoint mute. Muting never touches the
-  plugin or `mic.conf`. One worker thread re-reads the real mute state about
-  once per second.
+  plugin or `mic.conf`. One worker thread keeps the endpoint volume of the
+  selected microphone and gets mute changes from Windows through an
+  `IAudioEndpointVolumeCallback`; a 10 s refresh is only a safety net. It
+  looks the device up again when the selection or the device list changes.
+  If the selected microphone is not plugged in, toggling reports
+  "Microphone not found." instead of muting another device.
 - `health.rs`: the microphone health watch. A background thread registers an
   `IMMNotificationClient` for capture device changes and probes the
   microphone about once a second (registry: is the endpoint active, is
@@ -38,11 +52,20 @@ The app and plugin share `%ProgramData%\Hush`:
   and never run while "Hold to hear original" is pressed.
   Health states: Disconnected, Missing (reconnected without Hush attached),
   Not processing (an app records but `live.bin` is stale for more than 4 s),
-  Bypassed (still not processing 15 s after a restart), Failing, and an
-  informational "app uses another microphone" hint.
+  Bypassed (still not processing 15 s after a restart), Failing, Enhancements
+  off, and an informational "app uses another microphone" hint.
+  Enhancements off means Windows' "Audio enhancements" switch
+  (`{1da5d803-d492-4edd-8c23-e0c0ffee7f0e},5` = 1, in the endpoint's
+  Properties or FxProperties key) is off. Windows then skips every plugin
+  on that microphone, so Hush shows a banner with a **Sound settings** button
+  and never restarts audio or reports a bypass for it.
 - `notify.rs`: Windows toasts for unpackaged apps (AppUserModelId
   `Exel.Hush` registered under HKCU, PNG icon written by a small built-in
-  encoder).
+  encoder). Toasts use protocol activation: the installed copy (running from
+  `%ProgramFiles%\Hush`) registers a per-user `hush:` URL protocol
+  (`HKCU\Software\Classes\hush`) that runs `hush.exe --show`, so clicking a
+  toast opens the window through the normal second-launch path. Dev builds do
+  not register it.
 - `level_watch.rs`: raw input level warnings (clipping, too quiet).
 - `diagnostics.rs`: builds the text behind **Copy diagnostics**.
 - `settings_io.rs`: tuning snapshot, settings export and import.
