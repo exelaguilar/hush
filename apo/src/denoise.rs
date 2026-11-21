@@ -40,7 +40,7 @@ const OFF_DB: f32 = 0.5;
 const WATCHDOG_MS: usize = 400;
 
 fn samples_for_ms(rate: u32, ms: usize) -> usize {
-    ((rate as usize * ms) + 999) / 1000
+    (rate as usize * ms).div_ceil(1000)
 }
 
 fn queue_sizes(native_rate: u32) -> (usize, usize, usize) {
@@ -558,7 +558,7 @@ impl RateConversion {
     fn new(native_rate: u32) -> Result<Self, rubato::ResamplerConstructionError> {
         let native_rate = native_rate as usize;
         let model_rate = RATE as usize;
-        if native_rate % 100 == 0 {
+        if native_rate.is_multiple_of(100) {
             let native_hop = native_rate / 100;
             // Rubato 0.14's FftFixedInOut rounds the requested size in
             // output frames. Ask for one 10 ms hop in each direction.

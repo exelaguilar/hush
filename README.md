@@ -51,7 +51,8 @@ network calls unless you click **Check for updates**.
 
 **It's light.**
 It uses about 3% of one CPU core. There's no driver, so it works with Secure
-Boot on. Close the window and Hush keeps working from the tray.
+Boot on. Close the window and Hush keeps working from the tray in about 3 MB
+of memory.
 
 **It keeps itself working.**
 If you unplug and replug your mic and Windows drops Clean Mic, Hush notices
@@ -127,7 +128,7 @@ Hush wasn't thrown together. Every release went through the same process:
 - **No accidental changes.** Unchanged settings must reproduce the previous
   release's sound byte for byte, so a code change can't quietly change how
   you sound.
-- **89 automated tests** run on every push. Failure paths were tested by
+- **94 automated tests** run on every push. Failure paths were tested by
   deliberately crashing them: if processing ever fails, your mic keeps
   working unprocessed instead of taking Windows audio down with it.
 - **Used daily on real PCs** in Discord calls and games.

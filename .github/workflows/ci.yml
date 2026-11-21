@@ -17,16 +17,18 @@ env:
   # The installer's build script compresses its payload; keep it fast.
   CARGO_PROFILE_RELEASE_BUILD_OVERRIDE_OPT_LEVEL: "3"
 
+# Two jobs in parallel, each with its own cache: the release build (what
+# ships) and the debug-profile tests plus clippy.
 jobs:
-  windows:
+  release-build:
     runs-on: windows-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: release
 
       - name: Build application and APO payloads
         run: cargo build --release --workspace --exclude hush-installer
@@ -36,17 +38,29 @@ jobs:
           SM_PAYLOAD_DIR: ${{ github.workspace }}\target\release
         run: cargo build --release -p hush-installer
 
-      - name: Test workspace
-        run: cargo test --workspace --exclude hush-installer --all-targets
-
+      # --release reuses the optimized build script, so the payload is not
+      # recompressed by an unoptimized brotli.
       - name: Test installer
         env:
           SM_PAYLOAD_DIR: ${{ github.workspace }}\target\release
           # The installer's manifest asks for elevation; the test exe must not.
           __COMPAT_LAYER: RunAsInvoker
-        run: cargo test -p hush-installer
+        run: cargo test --release -p hush-installer
 
-      # Not blocking yet: see the warnings, fix them over time.
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: test
+
+      - name: Test workspace
+        run: cargo test --workspace --exclude hush-installer --all-targets
+
       - name: Clippy
-        continue-on-error: true
-        run: cargo clippy --workspace --exclude hush-installer --all-targets
+        run: cargo clippy --workspace --exclude hush-installer --all-targets -- -D warnings

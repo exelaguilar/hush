@@ -1,5 +1,5 @@
-//! System tray icon and menu. Events wake the UI (even while the window is
-//! hidden) through `request_repaint`.
+//! System tray icon and menu, owned by the tray agent. Events wake the
+//! agent's loop.
 
 use crate::icon_art::render_icon_state;
 use std::{
@@ -86,9 +86,6 @@ impl Tray {
             } else {
                 return;
             };
-            if matches!(action, TrayAction::Open | TrayAction::OpenMicTest) {
-                crate::instance::show_own_window();
-            }
             let _ = menu_sender.send(action);
             menu_wake();
         }));
@@ -105,7 +102,6 @@ impl Tray {
                 }
             );
             if open {
-                crate::instance::show_own_window();
                 let _ = sender.send(TrayAction::Open);
                 wake();
             }

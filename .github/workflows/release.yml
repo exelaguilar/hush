@@ -54,7 +54,7 @@ jobs:
           __COMPAT_LAYER: RunAsInvoker
         run: |
           cargo test --workspace --exclude hush-installer --all-targets
-          cargo test -p hush-installer
+          cargo test --release -p hush-installer
 
       - name: Package and checksum
         id: package

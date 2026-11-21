@@ -962,7 +962,7 @@ impl CleanMic {
             output_gain: 1.0,
             gain_coeff: time_coeff(20.0, rate_f),
             bypass_delay: [0.0; 2048],
-            bypass_delay_len: bypass_delay_len.min(2048).max(1),
+            bypass_delay_len: bypass_delay_len.clamp(1, 2048),
             bypass_position: 0,
             wet_mix: 1.0,
             high_pass_mix: 1.0,
@@ -976,7 +976,7 @@ impl CleanMic {
     /// two-frame lookahead, the gate's one-frame lookahead and the worker
     /// cushion.
     pub fn latency_frames(rate: u32) -> usize {
-        ((rate as usize * 60) + 999) / 1000
+        (rate as usize * 60).div_ceil(1000)
     }
 
     /// Clears filter history (used when the stream restarts).

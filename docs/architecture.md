@@ -5,7 +5,7 @@
 | File | Role |
 | --- | --- |
 | `hush_apo.dll` (`apo/`) | The audio plugin. Windows' audio engine (`audiodg.exe`) loads it on one microphone and runs every captured buffer through it. |
-| `hush.exe` (`src/`) | Tray app: settings, live meters, Mic Test. It never processes audio for other apps. |
+| `hush.exe` (`src/`) | The app, in two processes: the tray agent (always running, no window) and the window (`hush.exe --window`, only while open). It never processes audio for other apps. |
 | `hush-setup.exe` (`src/bin/hush-setup.rs`) | Installs and removes the plugin on a microphone, reports status. |
 | `Hush-Setup-<version>.exe` (`installer/`) | Wizard that embeds the three files above. Built by `package.ps1`. |
 
@@ -20,8 +20,37 @@ The app and plugin share `%ProgramData%\Hush`:
   with meter levels.
 - `installed.txt` records every registry value `hush-setup` wrote.
 
+## Two processes
+
+`hush.exe` runs as a **tray agent**: tray icon, microphone health watch and
+repairs, mute hotkey and notifications. It never creates a window, so it
+never loads a graphics driver and stays at a few MB. Opening Hush starts
+`hush.exe --window`, which draws the UI with egui/OpenGL and exits when
+closed. On a typical PC the OpenGL driver alone costs 100 MB or more, and it
+stays loaded for the life of the process even after the window closes,
+which is why the window is a separate process and not just a hidden one.
+
+The two share `mic.conf` and `%APPDATA%\Hush\app.conf` and each picks up
+the other's writes (by modification time). On top of that (`ipc.rs`):
+
+- The agent publishes what the window shows (health state, watched
+  microphone, repair in progress and its last error, hotkey error, apps
+  using the microphone) to `%APPDATA%\Hush\agent.state`, rewritten
+  atomically only when it changes.
+- Named events in the user's session carry requests: `Hush.Show` (open
+  the window; a second launch sets it), `Hush.Repair` / `Hush.Restart`
+  (*Fix now*), `Hush.Prefs` (preferences saved), `Hush.Quit`, and towards
+  the window `Hush.WindowShow` and `Hush.WindowClose`.
+- `Local\Hush.App` and `Local\Hush.Window` are the single-instance
+  mutexes.
+
+The agent's main thread waits on those events, a wake event set by its
+worker threads and its message queue (the tray icon), and runs one tick at
+least once a second.
+
 ## App modules (`src/`)
 
+- `agent.rs`: the tray agent (above). `ipc.rs`: the state file and events.
 - `ui/`: the window. `mod.rs` holds the app state and the update loop,
   `chrome.rs` the sidebar, header, health banner and the recording toast,
   and `pages/` one file per page (Microphone, Noise & Gate, Voice, Mic Test,
@@ -46,7 +75,9 @@ The app and plugin share `%ProgramData%\Hush`:
   `IMMNotificationClient` for capture device changes and probes the
   microphone about once a second (registry: is the endpoint active, is
   Hush's FX value on it; `IAudioSessionManager2`: is an app capturing, and
-  from which microphone). `Monitor` is the pure decision logic: input
+  from which microphone). The registry scan and each endpoint's session
+  manager are cached and redone on a device event, or every 5 s as a safety
+  net, so a steady state costs one session enumeration per microphone. `Monitor` is the pure decision logic: input
   snapshot and time in, health state, repair action and notification out.
   Automatic repairs are limited to one per 2 minutes and 3 per 30 minutes,
   and never run while "Hold to hear original" is pressed.
@@ -64,7 +95,8 @@ The app and plugin share `%ProgramData%\Hush`:
   encoder). Toasts use protocol activation: the installed copy (running from
   `%ProgramFiles%\Hush`) registers a per-user `hush:` URL protocol
   (`HKCU\Software\Classes\hush`) that runs `hush.exe --show`, so clicking a
-  toast opens the window through the normal second-launch path. Dev builds do
+  toast opens the window through the normal second-launch path (the agent
+  gets `Hush.Show` and starts the window). Dev builds do
   not register it.
 - `level_watch.rs`: raw input level warnings (clipping, too quiet).
 - `diagnostics.rs`: builds the text behind **Copy diagnostics**.

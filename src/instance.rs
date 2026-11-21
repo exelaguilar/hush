@@ -1,19 +1,17 @@
-//! One Hush per user session. A second launch (Start menu, shortcut)
-//! signals the running instance to show its window, then exits.
+//! One tray agent and one window per user session. A second launch
+//! (Start menu, shortcut, a clicked toast) signals the running one, then
+//! exits.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use windows::Win32::{
     Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE, HWND, LPARAM},
-    System::Threading::{
-        CreateEventW, CreateMutexW, GetCurrentProcessId, OpenEventW, SetEvent, WaitForSingleObject,
-        EVENT_MODIFY_STATE, INFINITE,
-    },
+    System::Threading::{CreateMutexW, GetCurrentProcessId},
     UI::WindowsAndMessaging::{
         AllowSetForegroundWindow, EnumWindows, GetWindowTextW, GetWindowThreadProcessId, IsIconic,
         SetForegroundWindow, ShowWindow, ASFW_ANY, SW_RESTORE, SW_SHOW,
     },
 };
-use windows_core::{w, BOOL};
+use windows_core::BOOL;
 
 /// Shows and focuses this process's main window ("Hush") directly via
 /// Win32. Works while the UI loop is idle with the window hidden, which is
@@ -51,18 +49,16 @@ pub struct Instance {
     _mutex: HANDLE,
 }
 
-/// Returns `None` if Hush is already running (after asking it to
-/// show itself).
-pub fn acquire() -> Option<Instance> {
+/// Takes the named mutex. Returns `None` if another process holds it,
+/// after setting that process's `show_event`.
+pub fn acquire(mutex_name: &str, show_event: &str) -> Option<Instance> {
+    let name = windows_core::HSTRING::from(mutex_name);
     unsafe {
-        let mutex = CreateMutexW(None, true, w!("Local\\Hush.App")).ok()?;
+        let mutex = CreateMutexW(None, true, windows_core::PCWSTR(name.as_ptr())).ok()?;
         if GetLastError() == ERROR_ALREADY_EXISTS {
             // Let the running instance bring its window to the foreground.
             let _ = AllowSetForegroundWindow(ASFW_ANY);
-            if let Ok(event) = OpenEventW(EVENT_MODIFY_STATE, false, w!("Local\\Hush.Show")) {
-                let _ = SetEvent(event);
-                let _ = CloseHandle(event);
-            }
+            crate::ipc::signal(show_event);
             let _ = CloseHandle(mutex);
             return None;
         }
@@ -70,22 +66,12 @@ pub fn acquire() -> Option<Instance> {
     }
 }
 
-/// Starts a thread that waits for "show" requests from later launches and
-/// calls `wake` (which should request a repaint of the UI).
-pub fn listen(wake: impl Fn() + Send + 'static) {
-    let event = unsafe { CreateEventW(None, false, false, w!("Local\\Hush.Show")) };
-    let Ok(event) = event else {
-        return;
-    };
-    let event = event.0 as usize;
-    std::thread::Builder::new()
-        .name("hush-instance".into())
-        .spawn(move || loop {
-            let handle = HANDLE(event as *mut _);
-            unsafe { WaitForSingleObject(handle, INFINITE) };
-            show_own_window();
-            SHOW_REQUESTED.store(true, Ordering::Release);
-            wake();
-        })
-        .ok();
+/// Window process: waits for `event` ("show the window") on a thread of
+/// its own, brings the window forward and calls `wake`.
+pub fn listen(event: &str, wake: impl Fn() + Send + 'static) {
+    crate::ipc::on_event(event, move || {
+        show_own_window();
+        SHOW_REQUESTED.store(true, Ordering::Release);
+        wake();
+    });
 }

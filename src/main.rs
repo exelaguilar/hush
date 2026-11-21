@@ -1,7 +1,13 @@
 //! Hush: system-tray app with live controls for the clean-mic APO and
 //! a built-in microphone test.
+//!
+//! One executable, two roles: `hush.exe` is the tray agent (always
+//! running, no graphics) and `hush.exe --window` is the window, started by
+//! the agent while it is open. See `ipc`.
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+#[cfg(windows)]
+mod agent;
 #[cfg(windows)]
 mod clipboard;
 #[cfg(windows)]
@@ -18,6 +24,8 @@ mod icon_art;
 mod install_state;
 #[cfg(windows)]
 mod instance;
+#[cfg(windows)]
+mod ipc;
 #[cfg(windows)]
 mod level_watch;
 #[cfg(windows)]
@@ -81,39 +89,34 @@ fn main() -> eframe::Result {
         uninstall();
         return Ok(());
     }
-    // Second launch (Start menu, shortcut, or a clicked toast, which runs
-    // `hush.exe --show`): bring the running Hush to the front and exit. When
-    // none is running this one starts and shows its window.
-    // Developer aid (debug builds): HUSH_SHOT runs beside an installed Hush.
-    let _instance = if dev::shot_path().is_some() {
-        None
-    } else {
-        let Some(instance) = instance::acquire() else {
+    let args: Vec<String> = std::env::args().collect();
+    let page = args
+        .iter()
+        .position(|arg| arg == ipc::PAGE_FLAG)
+        .and_then(|i| args.get(i + 1))
+        .cloned();
+    // Developer aid (debug builds): HUSH_SHOT runs a window beside an
+    // installed Hush.
+    if dev::shot_path().is_some() {
+        return ui::run(page);
+    }
+    if args.iter().any(|arg| arg == ipc::WINDOW_FLAG) {
+        // If a window is already open, it comes forward instead.
+        let Some(_window) = instance::acquire(r"Local\Hush.Window", ipc::EV_WINDOW_SHOW) else {
             return Ok(());
         };
-        Some(instance)
+        return ui::run(page);
+    }
+    // Second launch (Start menu, shortcut, or a clicked toast, which runs
+    // `hush.exe --show`): the running agent shows the window, and this one
+    // exits. When none is running this one becomes the agent.
+    let Some(_agent) = instance::acquire(r"Local\Hush.App", ipc::EV_SHOW) else {
+        return Ok(());
     };
-    let show = std::env::args().any(|arg| arg == notify::SHOW_FLAG || arg.starts_with("hush:"));
-    let start_hidden = !show && std::env::args().any(|arg| arg == prefs::MINIMIZED_FLAG);
-    let icon = eframe::egui::IconData {
-        rgba: icon_art::render_icon(64),
-        width: 64,
-        height: 64,
-    };
-    let options = eframe::NativeOptions {
-        viewport: eframe::egui::ViewportBuilder::default()
-            .with_title("Hush")
-            .with_inner_size(dev::window_size())
-            .with_min_inner_size([680.0, 480.0])
-            .with_icon(icon)
-            .with_visible(!start_hidden),
-        // Open in the middle of the screen instead of the top-left corner.
-        centered: true,
-        ..Default::default()
-    };
-    eframe::run_native(
-        "Hush",
-        options,
-        Box::new(move |cc| Ok(Box::new(ui::HushApp::new(&cc.egui_ctx, start_hidden)))),
-    )
+    let show = args
+        .iter()
+        .any(|arg| arg == notify::SHOW_FLAG || arg.starts_with("hush:"));
+    let start_hidden = !show && args.iter().any(|arg| arg == prefs::MINIMIZED_FLAG);
+    agent::run(!start_hidden, page);
+    Ok(())
 }

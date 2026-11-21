@@ -126,7 +126,7 @@ impl HushApp {
             theme::hint(
                 ui,
                 &format!(
-                    "In Discord and games, select \"{}\" directly (not the SteelSeries Sonar microphone), or your voice will be processed twice.",
+                    "In Discord and games, select \"{}\" directly, not another app's virtual microphone (such as SteelSeries Sonar), or your voice will be processed twice.",
                     if self.selected_mic.is_empty() { "your microphone" } else { &self.selected_mic }
                 ),
             );

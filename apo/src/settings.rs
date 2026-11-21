@@ -268,7 +268,7 @@ fn publish(settings: &MicSettings) {
 /// Take one bounded attempt so a preempted writer cannot stall audio.
 pub fn current() -> Option<MicSettings> {
     let version = SETTINGS_VERSION.load(Ordering::SeqCst);
-    if version == 0 || version % 2 != 0 {
+    if version == 0 || !version.is_multiple_of(2) {
         return None;
     }
     let v: [u32; FIELDS] = std::array::from_fn(|i| SHARED[i].load(Ordering::SeqCst));

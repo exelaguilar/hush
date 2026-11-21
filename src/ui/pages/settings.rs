@@ -33,12 +33,10 @@ impl HushApp {
             theme::row(
                 ui,
                 "Keep running in the tray",
-                "Closing the window hides it to the tray instead of quitting.",
+                "Closing the window keeps Hush running in the tray instead of quitting.",
                 |ui| {
                     if theme::switch(ui, &mut self.prefs.close_to_tray, "Close to tray").changed() {
-                        self.prefs_error = prefs::save(&self.prefs)
-                            .err()
-                            .map(|e| format!("Could not save: {e}"));
+                        self.save_prefs();
                     }
                 },
             );
@@ -81,7 +79,6 @@ impl HushApp {
                 |ui| {
                     if theme::switch(ui, &mut self.prefs.mute_hotkey, "Mute hotkey").changed() {
                         self.save_prefs();
-                        self.apply_hotkey();
                     }
                 },
             );
@@ -99,11 +96,10 @@ impl HushApp {
                     if key != self.prefs.mute_key {
                         self.prefs.mute_key = key;
                         self.save_prefs();
-                        self.apply_hotkey();
                     }
                 });
             }
-            if let Some(error) = &self.hotkey_error {
+            if let Some(error) = self.health.agent.hotkey_error.clone().filter(|_| self.prefs.mute_hotkey) {
                 ui.label(RichText::new(error).small().color(p.destructive));
             }
             theme::separator(ui);

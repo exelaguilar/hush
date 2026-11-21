@@ -38,6 +38,7 @@ impl HushApp {
             });
         });
         ui.add_space(18.0);
+        let attention = self.health.current().needs_attention();
         let mut nav = |ui: &mut egui::Ui, page: Page| {
             let selected = self.page == page;
             let text = RichText::new(page.label()).color(if selected {
@@ -54,7 +55,7 @@ impl HushApp {
                 .stroke(egui::Stroke::NONE)
                 .corner_radius(6)
                 .min_size(egui::vec2(ui.available_width(), 34.0));
-            let response = ui
+            let mut response = ui
                 .add(button)
                 .on_hover_cursor(egui::CursorIcon::PointingHand);
             if selected {
@@ -64,6 +65,13 @@ impl HushApp {
                     egui::vec2(3.0, 16.0),
                 );
                 ui.painter().rect_filled(bar, 2.0, p.primary);
+            }
+            if page == Page::Microphone && attention {
+                // The microphone needs attention: a dot leads there.
+                let r = response.rect;
+                ui.painter()
+                    .circle_filled(egui::pos2(r.right() - 14.0, r.center().y), 4.0, p.warning);
+                response = response.on_hover_text(self.health.current().short());
             }
             if response.clicked() {
                 self.page = page;
@@ -85,7 +93,14 @@ impl HushApp {
         ui.horizontal(|ui| {
             let (color, text) = self.status();
             ui.label(theme::semibold_text("Clean Mic").size(16.0));
-            theme::badge(ui, color, text);
+            match (text, self.apps_label()) {
+                ("Active", Some(apps)) => {
+                    theme::badge(ui, color, &format!("Active · {apps}"));
+                }
+                _ => {
+                    theme::badge(ui, color, text);
+                }
+            }
             let talking = self
                 .live_levels
                 .is_some_and(|l| l.voice && l.age_ms() < 1500 && self.settings.enabled);
@@ -95,7 +110,7 @@ impl HushApp {
             if self.mute.is_muted() {
                 theme::badge(ui, palette(ui).destructive, "Muted");
             }
-            match self.health.current {
+            match self.health.current() {
                 health::Health::Disconnected => {
                     theme::badge(ui, palette(ui).warning, "Disconnected");
                 }
@@ -123,19 +138,20 @@ impl HushApp {
     }
 
     pub(in crate::ui) fn health_banner(&mut self, ui: &mut egui::Ui) {
-        let fixing = self.health.repair_job.is_some();
-        if self.health.current == health::Health::Healthy && !fixing {
+        let fixing = self.health.repairing();
+        let current = self.health.current().clone();
+        if current == health::Health::Healthy && !fixing {
             return;
         }
         let p = palette(ui);
-        let informational = !self.health.current.needs_attention();
+        let informational = !current.needs_attention();
         let message = if fixing {
             "Fixing Clean Mic…".to_string()
         } else {
-            self.health.current.message(&self.health.target)
+            current.message(self.health.target())
         };
-        let fix = self.health.current.fix().filter(|_| !fixing);
-        let sound_settings = self.health.current == health::Health::EnhancementsOff && !fixing;
+        let fix = current.fix().filter(|_| !fixing);
+        let sound_settings = current == health::Health::EnhancementsOff && !fixing;
         let mut clicked = false;
         theme::card(ui, None, None, |ui| {
             ui.horizontal(|ui| {
@@ -148,7 +164,7 @@ impl HushApp {
                         p.warning
                     };
                     ui.label(RichText::new(message).small().color(color));
-                    if let Some(note) = &self.health.repair_note {
+                    if let Some(note) = self.health.note() {
                         theme::hint(ui, note);
                     }
                 });
@@ -168,7 +184,7 @@ impl HushApp {
         ui.add_space(12.0);
         if let (true, Some(kind)) = (clicked, fix) {
             // The user asked for it, so the UAC fallback is allowed.
-            self.start_repair(kind, true, true);
+            self.fix_now(kind);
         }
     }
 
@@ -207,8 +223,7 @@ impl HushApp {
             .is_some_and(|at| at.elapsed() < Duration::from_secs(2));
         let label = if copied { "Copied" } else { "Copy diagnostics" };
         if theme::outline_button(ui, label).clicked() {
-            let ctx = ui.ctx().clone();
-            self.copy_diagnostics(&ctx);
+            self.copy_diagnostics();
         }
     }
 

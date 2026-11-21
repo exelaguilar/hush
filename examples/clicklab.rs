@@ -366,6 +366,7 @@ fn guard(raw: &[f32], processed: &[f32], rate: u32, delay: usize) -> Guard {
     let raw_high = band(raw, rate, 4000.0, 16000.0);
     let out_high = band(processed, rate, 4000.0, 16000.0);
     let mut consonants = Vec::new();
+    #[allow(clippy::needless_range_loop)] // f also indexes the sample ranges
     for f in 0..frames {
         let range = f * hop..(f + 1) * hop;
         let high = power(&raw_high[range.clone()]);

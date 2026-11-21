@@ -1,5 +1,36 @@
 # Changelog
 
+## 1.1.0
+
+**Much lighter in the tray**
+- Hush now runs as two processes. The tray part (tray icon, microphone
+  health watch, repairs, mute hotkey and notifications) never loads graphics.
+  It uses about 3 MB of memory instead of 75 to 250 MB, with 7 threads
+  instead of 48, and a fraction of the idle CPU time.
+- The window is its own process, started when you open Hush and gone when you
+  close it, so the graphics driver's memory is only used while you look at it.
+- The microphone health check caches the device list and audio sessions
+  between checks and only rescans when Windows reports a device change.
+
+**New**
+- The status badge shows which apps are using your microphone, for example
+  *Active · Discord*.
+- The window reopens where you left it, unless that spot is no longer on a
+  screen.
+- A dot next to *Microphone* in the sidebar shows when your mic needs
+  attention.
+
+**Fixes**
+- The setup hint no longer assumes you use SteelSeries Sonar: it warns about
+  any other app's virtual microphone.
+- Closing the window while *Hold to hear original* is pressed no longer
+  leaves Clean Mic bypassed.
+
+**Behind the scenes**
+- CI runs the release build and the tests in parallel and keeps its cache.
+  1.0.1's CI was cancelled by its time limit even though every test passed.
+- Clippy warnings fail the build now that there are none.
+
 ## 1.0.1
 
 **Fixes**

@@ -24,7 +24,7 @@ driver, and the audio is processed once however many apps are listening.
 | Part | What it does |
 | --- | --- |
 | `hush_apo.dll` | The audio plugin. Runs inside `audiodg.exe` on the selected mic. |
-| `hush.exe` | Tray app: settings, live meters, Mic Test, the health watch. It never processes audio for other apps. |
+| `hush.exe` | The app. In the tray it runs the health watch, repairs, mute hotkey and notifications with no window and no graphics. Opening Hush starts a second `hush.exe` for the window (settings, live meters, Mic Test), which exits when you close it. It never processes audio for other apps. |
 | `hush-setup.exe` | Attaches the plugin to a microphone, removes it, reports status and repairs it. |
 | `Hush-Setup-<version>.exe` | The installer, which embeds the three files above. |
 
@@ -55,9 +55,9 @@ App preferences such as startup, tray, mute hotkey and notifications live in
 
 | | |
 | --- | --- |
-| CPU | About 3% of one core, from offline measurements. |
+| CPU | About 3% of one core for the audio processing, from offline measurements. The tray app adds well under 0.1% while idle. |
 | Added delay | About 75 ms, calculated from the model's look-ahead plus a 20 ms safety buffer. Not measured end to end. |
-| Memory | The neural model loads inside `audiodg.exe` while a stream is open. |
+| Memory | The tray app uses about 3 MB. The window adds about 80 MB, mostly the graphics driver, only while it is open. The neural model loads inside `audiodg.exe` while a stream is open. |
 | Network | None. The only network call is **Check for updates**, which runs only when you click it. |
 
 When **Clean Mic** is off, the effects are bypassed. The model keeps running
@@ -65,8 +65,9 @@ at a nearly inaudible setting so the audio stream's delay stays constant.
 
 ## Microphone health and repair
 
-The app watches the microphone that Clean Mic is installed on. It listens
-for Windows device changes and probes about once a second:
+The tray app watches the microphone that Clean Mic is installed on. It
+listens for Windows device changes and probes about once a second, reusing
+its last device scan until Windows reports a change:
 
 | State | Detected by | Action |
 | --- | --- | --- |

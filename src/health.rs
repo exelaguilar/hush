@@ -13,14 +13,14 @@
 use crate::{endpoints, install_state};
 use hush_apo::settings;
 use std::{
-    collections::{hash_map::DefaultHasher, VecDeque},
+    collections::{hash_map::DefaultHasher, HashMap, VecDeque},
     hash::{Hash, Hasher},
     path::Path,
     sync::mpsc,
     time::{Duration, Instant, SystemTime},
 };
 use windows::{
-    core::{implement, Interface, PCWSTR, PWSTR},
+    core::{implement, Interface, HSTRING, PCWSTR, PWSTR},
     Win32::{
         Foundation::{CloseHandle, PROPERTYKEY},
         Media::Audio::{
@@ -71,6 +71,8 @@ pub struct Probe {
     pub capture_key: u64,
     /// (app, microphone) actively capturing from a different microphone.
     pub capture_other: Option<(String, String)>,
+    /// Apps capturing from this microphone, by display name.
+    pub apps: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -91,8 +93,9 @@ pub struct Config {
     pub hold_pressed: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum Health {
+    #[default]
     Healthy,
     Disconnected,
     /// Reconnected under a new id, or its FX values are gone.
@@ -111,6 +114,33 @@ pub enum Health {
 impl Health {
     pub fn needs_attention(&self) -> bool {
         !matches!(self, Health::Healthy | Health::WrongMic { .. })
+    }
+
+    /// Stable id for the agent state file (`WrongMic` is stored apart).
+    pub fn id(&self) -> &'static str {
+        match self {
+            Health::Healthy => "healthy",
+            Health::Disconnected => "disconnected",
+            Health::Missing => "missing",
+            Health::NotProcessing => "not_processing",
+            Health::Bypassed => "bypassed",
+            Health::Failing => "failing",
+            Health::EnhancementsOff => "enhancements_off",
+            Health::WrongMic { .. } => "wrong_mic",
+        }
+    }
+
+    pub fn from_id(id: &str) -> Option<Health> {
+        Some(match id {
+            "healthy" => Health::Healthy,
+            "disconnected" => Health::Disconnected,
+            "missing" => Health::Missing,
+            "not_processing" => Health::NotProcessing,
+            "bypassed" => Health::Bypassed,
+            "failing" => Health::Failing,
+            "enhancements_off" => Health::EnhancementsOff,
+            _ => return None,
+        })
     }
 
     /// Short label for badges and the tray tooltip.
@@ -427,36 +457,93 @@ impl Monitor {
 
 // -- System probes -----------------------------------------------------------------
 
-/// Active capture sessions on one endpoint: process ids.
-fn active_sessions(enumerator: &IMMDeviceEnumerator, id: &str) -> Vec<u32> {
-    let mut pids = Vec::new();
-    let full: Vec<u16> = endpoints::full_device_id(id)
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
-    unsafe {
-        let Ok(device) = enumerator.GetDevice(PCWSTR(full.as_ptr())) else {
-            return pids;
-        };
-        let Ok(manager) = device.Activate::<IAudioSessionManager2>(CLSCTX_ALL, None) else {
-            return pids;
-        };
-        let Ok(sessions) = manager.GetSessionEnumerator() else {
-            return pids;
-        };
-        for index in 0..sessions.GetCount().unwrap_or(0) {
-            let Ok(control) = sessions.GetSession(index) else {
-                continue;
+/// What the probe keeps between runs, so a steady state costs little:
+/// the registry scan of capture endpoints (redone on device events and
+/// every few seconds), each endpoint's session manager, and process names.
+#[derive(Default)]
+struct ProbeCache {
+    endpoints: Vec<endpoints::Endpoint>,
+    recorded: Vec<(String, String)>,
+    scanned: Option<Instant>,
+    managers: HashMap<String, IAudioSessionManager2>,
+    names: HashMap<u32, String>,
+}
+
+/// Safety-net rescan of the endpoint registry when no event arrived.
+const RESCAN: Duration = Duration::from_secs(5);
+
+impl ProbeCache {
+    /// Forget everything about devices (a device was added, removed or changed).
+    fn invalidate(&mut self) {
+        self.scanned = None;
+        self.managers.clear();
+    }
+
+    fn refresh(&mut self) {
+        if self.scanned.is_some_and(|at| at.elapsed() < RESCAN) {
+            return;
+        }
+        self.endpoints = endpoints::capture_endpoints();
+        self.recorded = install_state::recorded_endpoints();
+        self.scanned = Some(Instant::now());
+        let active: Vec<&str> = self
+            .endpoints
+            .iter()
+            .filter(|e| e.active)
+            .map(|e| e.id.as_str())
+            .collect();
+        self.managers.retain(|id, _| active.contains(&id.as_str()));
+    }
+
+    fn name(&mut self, pid: u32) -> String {
+        if self.names.len() > 64 {
+            self.names.clear();
+        }
+        self.names
+            .entry(pid)
+            .or_insert_with(|| process_name(pid))
+            .clone()
+    }
+
+    /// Active capture sessions on one endpoint: process ids.
+    fn active_sessions(&mut self, enumerator: &IMMDeviceEnumerator, id: &str) -> Vec<u32> {
+        let mut pids = Vec::new();
+        if !self.managers.contains_key(id) {
+            let full = HSTRING::from(endpoints::full_device_id(id));
+            let manager = unsafe {
+                enumerator
+                    .GetDevice(PCWSTR(full.as_ptr()))
+                    .and_then(|device| device.Activate::<IAudioSessionManager2>(CLSCTX_ALL, None))
             };
-            if control.GetState().ok() != Some(AudioSessionStateActive) {
-                continue;
-            }
-            if let Ok(control2) = control.cast::<IAudioSessionControl2>() {
-                pids.push(control2.GetProcessId().unwrap_or(0));
+            match manager {
+                Ok(manager) => {
+                    self.managers.insert(id.to_string(), manager);
+                }
+                Err(_) => return pids,
             }
         }
+        let Some(manager) = self.managers.get(id) else {
+            return pids;
+        };
+        unsafe {
+            let Ok(sessions) = manager.GetSessionEnumerator() else {
+                self.managers.remove(id);
+                return pids;
+            };
+            for index in 0..sessions.GetCount().unwrap_or(0) {
+                let Ok(control) = sessions.GetSession(index) else {
+                    continue;
+                };
+                if control.GetState().ok() != Some(AudioSessionStateActive) {
+                    continue;
+                }
+                if let Ok(control2) = control.cast::<IAudioSessionControl2>() {
+                    pids.push(control2.GetProcessId().unwrap_or(0));
+                }
+            }
+        }
+        pids
     }
-    pids
 }
 
 /// "chrome" from a process id.
@@ -489,12 +576,36 @@ fn process_name(pid: u32) -> String {
     }
 }
 
-fn probe(enumerator: &IMMDeviceEnumerator, mic: &str) -> Probe {
+/// Display name for a process name ("obs64" -> "OBS"). `None` for Hush
+/// itself, whose Mic Test is not "an app using the mic".
+pub fn app_label(process: &str) -> Option<String> {
+    let lower = process.to_ascii_lowercase();
+    let known = match lower.as_str() {
+        "hush" => return None,
+        "obs64" | "obs32" | "obs" => "OBS",
+        "msedge" | "msedgewebview2" => "Edge",
+        "ms-teams" | "teams" => "Teams",
+        "steamwebhelper" | "steam" => "Steam",
+        "zoom" => "Zoom",
+        "firefox" => "Firefox",
+        "chrome" => "Chrome",
+        "discord" | "discordptb" | "discordcanary" => "Discord",
+        _ => "",
+    };
+    if !known.is_empty() {
+        return Some(known.to_string());
+    }
+    let mut chars = process.chars();
+    chars
+        .next()
+        .map(|first| first.to_uppercase().chain(chars).collect())
+}
+
+fn probe(enumerator: &IMMDeviceEnumerator, mic: &str, cache: &mut ProbeCache) -> Probe {
     let mut probe = Probe::default();
-    // One registry pass for the whole probe.
-    let all = endpoints::capture_endpoints();
-    let recorded = install_state::recorded_endpoints();
-    probe.endpoint_active = recorded.iter().any(|(flow, id)| {
+    cache.refresh();
+    let all = cache.endpoints.clone();
+    probe.endpoint_active = cache.recorded.iter().any(|(flow, id)| {
         flow == "Capture"
             && all
                 .iter()
@@ -513,18 +624,29 @@ fn probe(enumerator: &IMMDeviceEnumerator, mic: &str) -> Probe {
     let mut keys: Vec<u32> = Vec::new();
     for endpoint in &active {
         let (id, name) = (&endpoint.id, &endpoint.name);
-        let pids = active_sessions(enumerator, id);
+        let pids = cache.active_sessions(enumerator, id);
         if endpoints::names_match(name, mic) {
             if !pids.is_empty() {
                 probe.capturing_here = true;
             }
+            for pid in &pids {
+                if *pid == own {
+                    continue;
+                }
+                if let Some(label) = app_label(&cache.name(*pid)) {
+                    if !probe.apps.contains(&label) {
+                        probe.apps.push(label);
+                    }
+                }
+            }
             keys.extend(pids);
         } else if probe.capture_other.is_none() {
             if let Some(pid) = pids.into_iter().find(|pid| *pid != own) {
-                probe.capture_other = Some((process_name(pid), name.clone()));
+                probe.capture_other = Some((cache.name(pid), name.clone()));
             }
         }
     }
+    probe.apps.sort();
     keys.sort_unstable();
     let mut hasher = DefaultHasher::new();
     keys.hash(&mut hasher);
@@ -666,6 +788,7 @@ fn worker(
     }
     let mut last: Option<Probe> = None;
     let mut changed = false;
+    let mut cache = ProbeCache::default();
     if let Some(enumerator) = &enumerator {
         'watch: loop {
             match inbox.recv_timeout(Duration::from_secs(1)) {
@@ -682,7 +805,10 @@ fn worker(
                     Msg::Stop => break 'watch,
                 }
             }
-            let current = probe(enumerator, &mic);
+            if changed {
+                cache.invalidate();
+            }
+            let current = probe(enumerator, &mic, &mut cache);
             let differs = last.as_ref() != Some(&current);
             if differs || changed {
                 let _ = outbox.send(Update {
@@ -862,6 +988,7 @@ mod tests {
                 capturing_here: true,
                 capture_key: 1,
                 capture_other: None,
+                apps: Vec::new(),
             },
             live_age_ms: Some(50),
         }
@@ -1080,5 +1207,14 @@ mod tests {
         assert_eq!(file.result, "repaired");
         assert_eq!(file.message, "Done it.");
         assert_eq!(parse_repair("nothing useful"), None);
+    }
+
+    #[test]
+    fn app_labels_are_friendly_and_skip_hush() {
+        assert_eq!(app_label("obs64").as_deref(), Some("OBS"));
+        assert_eq!(app_label("Discord").as_deref(), Some("Discord"));
+        assert_eq!(app_label("vrchat").as_deref(), Some("Vrchat"));
+        assert_eq!(app_label("hush"), None);
+        assert_eq!(app_label(""), None);
     }
 }

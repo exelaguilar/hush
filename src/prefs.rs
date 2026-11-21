@@ -94,6 +94,50 @@ pub struct Prefs {
     pub auto_repair: bool,
     /// Windows notifications about microphone health.
     pub notifications: bool,
+    /// Where the window was when it last closed.
+    pub window: Option<WindowRect>,
+}
+
+/// Window position and size in points, plus the pixels per point at the
+/// time (to check the position is still on a screen).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WindowRect {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    pub pixels_per_point: f32,
+}
+
+impl WindowRect {
+    fn id(&self) -> String {
+        format!(
+            "{},{},{},{},{}",
+            self.x, self.y, self.width, self.height, self.pixels_per_point
+        )
+    }
+
+    fn from_id(text: &str) -> Option<WindowRect> {
+        let values: Vec<f32> = text
+            .split(',')
+            .map(|v| v.trim().parse::<f32>())
+            .collect::<Result<_, _>>()
+            .ok()?;
+        let [x, y, width, height, pixels_per_point] = values[..] else {
+            return None;
+        };
+        let sane = values.iter().all(|v| v.is_finite())
+            && (200.0..=10_000.0).contains(&width)
+            && (200.0..=10_000.0).contains(&height)
+            && (0.5..=8.0).contains(&pixels_per_point);
+        sane.then_some(WindowRect {
+            x,
+            y,
+            width,
+            height,
+            pixels_per_point,
+        })
+    }
 }
 
 impl Default for Prefs {
@@ -105,16 +149,21 @@ impl Default for Prefs {
             mute_key: MuteKey::default(),
             auto_repair: true,
             notifications: true,
+            window: None,
         }
     }
 }
 
-fn path() -> PathBuf {
+/// `%APPDATA%\Hush`: per-user app files.
+pub fn dir() -> PathBuf {
     std::env::var_os("APPDATA")
         .map(PathBuf::from)
         .unwrap_or_default()
         .join("Hush")
-        .join("app.conf")
+}
+
+pub fn path() -> PathBuf {
+    dir().join("app.conf")
 }
 
 fn flag(value: &str) -> Option<bool> {
@@ -141,6 +190,7 @@ pub fn load() -> Prefs {
             "auto_repair" => prefs.auto_repair = flag(value).unwrap_or(prefs.auto_repair),
             "notifications" => prefs.notifications = flag(value).unwrap_or(prefs.notifications),
             "mute_key" => prefs.mute_key = MuteKey::from_id(value).unwrap_or(prefs.mute_key),
+            "window" => prefs.window = WindowRect::from_id(value),
             _ => {}
         }
     }
@@ -153,18 +203,19 @@ pub fn save(prefs: &Prefs) -> std::io::Result<()> {
         std::fs::create_dir_all(dir)?;
     }
     let on = |b: bool| if b { "on" } else { "off" };
-    std::fs::write(
-        path,
-        format!(
-            "close_to_tray = {}\ntray_hint_shown = {}\nmute_hotkey = {}\nmute_key = {}\nauto_repair = {}\nnotifications = {}\n",
-            on(prefs.close_to_tray),
-            on(prefs.tray_hint_shown),
-            on(prefs.mute_hotkey),
-            prefs.mute_key.id(),
-            on(prefs.auto_repair),
-            on(prefs.notifications)
-        ),
-    )
+    let mut text = format!(
+        "close_to_tray = {}\ntray_hint_shown = {}\nmute_hotkey = {}\nmute_key = {}\nauto_repair = {}\nnotifications = {}\n",
+        on(prefs.close_to_tray),
+        on(prefs.tray_hint_shown),
+        on(prefs.mute_hotkey),
+        prefs.mute_key.id(),
+        on(prefs.auto_repair),
+        on(prefs.notifications)
+    );
+    if let Some(window) = prefs.window {
+        text.push_str(&format!("window = {}\n", window.id()));
+    }
+    std::fs::write(path, text)
 }
 
 /// True if Hush starts at sign-in for this user.
@@ -193,5 +244,26 @@ pub fn set_start_with_windows(enabled: bool) -> std::io::Result<()> {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             other => other,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn window_rect_round_trips_and_rejects_nonsense() {
+        let rect = WindowRect {
+            x: -1200.5,
+            y: 80.0,
+            width: 900.0,
+            height: 720.0,
+            pixels_per_point: 1.5,
+        };
+        assert_eq!(WindowRect::from_id(&rect.id()), Some(rect));
+        assert_eq!(WindowRect::from_id("1,2,3"), None);
+        assert_eq!(WindowRect::from_id("0,0,50,50,1"), None);
+        assert_eq!(WindowRect::from_id("0,0,900,700,NaN"), None);
+        assert_eq!(WindowRect::from_id("garbage"), None);
     }
 }
