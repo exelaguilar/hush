@@ -497,6 +497,21 @@ mod install {
             log(&log_to, warning.clone());
         }
 
+        // Automatic repairs (after a replug) run through two scheduled
+        // tasks. Only the installed hush-setup.exe may create them, so this
+        // runs after the staging copy is gone. Without them Hush still
+        // works and asks for permission to repair.
+        log(&log_to, "Creating the repair tasks");
+        if let Err(error) = run_logged(
+            &log_to,
+            Command::new(dir.join("hush-setup.exe")).arg("create-repair-tasks"),
+        ) {
+            log(
+                &log_to,
+                format!("  warning: could not create the repair tasks ({error}); Hush will ask for permission to repair"),
+            );
+        }
+
         log(&log_to, "Adding Start menu shortcut");
         let shortcut = data_dir().join(r"Microsoft\Windows\Start Menu\Programs\Hush.lnk");
         let script = "$ErrorActionPreference = 'Stop'; $s = (New-Object -ComObject WScript.Shell).CreateShortcut($env:HUSH_SETUP_SHORTCUT); $s.TargetPath = $env:HUSH_SETUP_TARGET; $s.WorkingDirectory = $env:HUSH_SETUP_DIR; $s.IconLocation = $env:HUSH_SETUP_TARGET + ',0'; $s.Description = 'Hush'; $s.Save()";

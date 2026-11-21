@@ -21,6 +21,10 @@
   attention.
 
 **Fixes**
+- The installer now creates the two repair tasks. Since 1.0.0 it ran the
+  setup step from a staging folder, which the tasks refuse to point at, so
+  automatic repair after a replug could not run without an administrator
+  prompt. Install 1.1.0 once to get them.
 - The setup hint no longer assumes you use SteelSeries Sonar: it warns about
   any other app's virtual microphone.
 - Closing the window while *Hold to hear original* is pressed no longer

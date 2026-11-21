@@ -509,10 +509,14 @@ mod windows_main {
     fn install(out: &Out, mic: &str, slot: &str, restart: bool, replace_mic: bool) -> Result<()> {
         let endpoint = find_mic(mic)?;
         install_endpoint(out, &endpoint, slot, restart, replace_mic, &[])?;
-        if let Err(error) = create_repair_tasks(out) {
-            out.line(format!(
-                "  warning: could not create the repair tasks ({error:#}); Hush will ask for permission to repair"
-            ));
+        // The installer runs this from a staging folder and then creates the
+        // tasks with the installed copy (`create-repair-tasks`).
+        if is_installed_copy() {
+            if let Err(error) = create_repair_tasks(out) {
+                out.line(format!(
+                    "  warning: could not create the repair tasks ({error:#}); Hush will ask for permission to repair"
+                ));
+            }
         }
         out.line("Done. Open any app that uses the microphone, then run: hush-setup status");
         Ok(())
@@ -1294,6 +1298,19 @@ mod windows_main {
         Ok(command)
     }
 
+    /// Whether this is `%ProgramFiles%\Hush\hush-setup.exe`, the only copy the
+    /// repair tasks may point at.
+    fn is_installed_copy() -> bool {
+        let (Ok(dir), Ok(current)) = (program_dir(), std::env::current_exe()) else {
+            return false;
+        };
+        let exe = dir.join(SETUP_EXE);
+        matches!(
+            (fs::canonicalize(&exe), fs::canonicalize(&current)),
+            (Ok(a), Ok(b)) if a == b
+        )
+    }
+
     /// Creates (or replaces) both tasks. Refuses unless this exe is the one in
     /// the Program Files folder, because the tasks run it as SYSTEM and only
     /// an administrator-writable location is safe for that.
@@ -1301,8 +1318,7 @@ mod windows_main {
         use std::io::Write;
         let dir = program_dir()?;
         let exe = dir.join(SETUP_EXE);
-        let current = std::env::current_exe()?;
-        if !exe.exists() || fs::canonicalize(&exe)? != fs::canonicalize(&current)? {
+        if !is_installed_copy() {
             bail!(
                 "hush-setup is not running from {} (repair tasks are only created by the installed copy)",
                 dir.display()
@@ -1470,7 +1486,10 @@ mod windows_main {
             mute: false,
         };
         let command = args.first().map(String::as_str).unwrap_or("help");
-        let needs_admin = matches!(command, "install" | "uninstall" | "uninstall-app" | "repair");
+        let needs_admin = matches!(
+            command,
+            "install" | "uninstall" | "uninstall-app" | "repair" | "create-repair-tasks"
+        );
         if needs_admin && !is_admin() {
             let forwarded: Vec<String> = args.iter().filter(|a| !a.is_empty()).cloned().collect();
             return relaunch_elevated(&forwarded);
@@ -1489,11 +1508,14 @@ mod windows_main {
                 repair_task_status();
                 Ok(())
             }
+            "create-repair-tasks" => create_repair_tasks(&out).map(|()| {
+                out.line("Repair tasks created.");
+            }),
             "uninstall" => uninstall(&out, restart, has("--purge")),
             "uninstall-app" => uninstall_app(&out, has("--quiet")),
             _ => {
                 println!(
-                    "usage: hush-setup list | status | install --mic <name> [--slot efx|lfx] | repair [--restart-audio] [--quiet] | repair-task-status | uninstall [--purge] | uninstall-app [--quiet]"
+                    "usage: hush-setup list | status | install --mic <name> [--slot efx|lfx] | repair [--restart-audio] [--quiet] | repair-task-status | create-repair-tasks | uninstall [--purge] | uninstall-app [--quiet]"
                 );
                 Ok(())
             }
