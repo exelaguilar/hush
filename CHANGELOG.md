@@ -5,7 +5,8 @@
 **New**
 - Clean Mic reports its own CPU use. *About → Status* and *Copy
   diagnostics* show it, for example *Clean Mic's CPU use: 2.4% of one core*,
-  measured inside the audio engine over the last second.
+  measured inside the audio engine over the last second. On the developer's
+  PC it reads 0.8% to 3.4% during a Discord call.
 - Optional *Clean Mic on/off hotkey* (Settings), off by default. It flips
   Clean Mic from anywhere for a quick before and after in a call or game.
 
