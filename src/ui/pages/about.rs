@@ -40,6 +40,16 @@ impl HushApp {
                     }
                 ),
             );
+            if let Some(permille) = self.state.cpu_permille {
+                theme::hint(
+                    ui,
+                    &format!(
+                        "Clean Mic's CPU use: {}.{}% of one core",
+                        permille / 10,
+                        permille % 10
+                    ),
+                );
+            }
             theme::hint(
                 ui,
                 &format!(

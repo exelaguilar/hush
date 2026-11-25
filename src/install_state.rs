@@ -14,6 +14,9 @@ pub struct InstallState {
     pub running: bool,
     /// Late frames (short audio gaps) reported by the APO since it started.
     pub glitches: u64,
+    /// Clean Mic's own CPU use while processing, in tenths of a percent of
+    /// one core (as the plugin measured it over the last second).
+    pub cpu_permille: Option<u32>,
 }
 
 /// Endpoints recorded by `hush-setup` as (flow, id), without duplicates.
@@ -54,7 +57,8 @@ pub fn read() -> InstallState {
     InstallState {
         attached,
         running,
-        glitches: status.map(|s| s.underruns).unwrap_or(0),
+        glitches: status.as_ref().map(|s| s.underruns).unwrap_or(0),
+        cpu_permille: status.and_then(|s| s.cpu_permille).filter(|_| running),
     }
 }
 

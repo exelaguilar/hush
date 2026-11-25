@@ -128,6 +128,41 @@ impl HushApp {
             }
         });
         ui.add_space(12.0);
+        theme::card(ui, Some("Clean Mic hotkey"), None, |ui| {
+            theme::row(
+                ui,
+                "Clean Mic on/off hotkey",
+                "Turns Clean Mic on and off from anywhere, for a quick before and after in a call or game.",
+                |ui| {
+                    if theme::switch(ui, &mut self.prefs.toggle_hotkey, "Clean Mic hotkey")
+                        .changed()
+                    {
+                        self.save_prefs();
+                    }
+                },
+            );
+            if self.prefs.toggle_hotkey {
+                theme::separator(ui);
+                theme::row_sized(ui, "Key", "", 160.0, |ui| {
+                    let mut key = self.prefs.toggle_key;
+                    egui::ComboBox::from_id_salt("clean-mic-key")
+                        .selected_text(key.label())
+                        .show_ui(ui, |ui| {
+                            for option in prefs::MuteKey::ALL {
+                                ui.selectable_value(&mut key, option, option.label());
+                            }
+                        });
+                    if key != self.prefs.toggle_key {
+                        self.prefs.toggle_key = key;
+                        self.save_prefs();
+                    }
+                });
+                if let Some(error) = self.health.agent.toggle_hotkey_error.clone() {
+                    ui.label(RichText::new(error).small().color(p.destructive));
+                }
+            }
+        });
+        ui.add_space(12.0);
         theme::card(ui, Some("Microphone settings"), None, |ui| {
             theme::row_sized(
                 ui,

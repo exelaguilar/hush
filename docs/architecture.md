@@ -15,7 +15,12 @@ The app and plugin share `%ProgramData%\Hush`:
   every 250 ms. Unknown keys are ignored and missing keys use defaults, so
   older and newer settings files load safely.
 - `status.txt` is a heartbeat the plugin writes once a second while audio
-  flows.
+  flows (every 30 s otherwise). It includes `cpu_permille`, Clean Mic's own
+  CPU use over the last second in tenths of a percent of one core: the
+  denoiser thread's CPU time (`GetThreadTimes`, read by the thread itself
+  twice a second) plus the time spent in the audio callback. The plugin's
+  helper thread wakes 20 times a second while audio flows and 4 times a
+  second after 2 s without audio.
 - `live.bin` is a memory-mapped file the plugin updates 20 times a second
   with meter levels.
 - `installed.txt` records every registry value `hush-setup` wrote.

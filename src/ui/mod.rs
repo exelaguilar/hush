@@ -37,6 +37,8 @@ static CLOSE_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 /// How often the window re-reads the agent's state and mic.conf.
 const SYNC_EVERY: Duration = Duration::from_millis(400);
+/// Frame time while meters move (20 fps).
+const METER_FRAME: Duration = Duration::from_millis(50);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Page {
@@ -521,9 +523,12 @@ impl HushApp {
     fn start_test(&mut self) {
         match mic_test::MicTest::start(&self.selected_mic) {
             Ok(test) => {
-                test.set_monitor(self.test_state.monitor);
-                self.test_state.mic = Some(test);
                 self.test_state.error = None;
+                if let Err(error) = test.set_monitor(self.test_state.monitor) {
+                    self.test_state.monitor = false;
+                    self.test_state.error = Some(format!("{error:#}"));
+                }
+                self.test_state.mic = Some(test);
             }
             Err(error) => self.test_state.error = Some(format!("{error:#}")),
         }
@@ -706,9 +711,16 @@ impl eframe::App for HushApp {
             || self.jobs.update.is_some()
             || self.diag_copied.is_some()
             || self.health.repairing();
+        // Meters are drawn at 20 fps (the plugin's own update rate), and
+        // only on the pages that show them; elsewhere live audio only moves
+        // the "Talking" badge.
         let live = self.live_levels.is_some_and(|l| l.age_ms() < 1500);
-        if self.test_state.mic.is_some() || busy || live || self.comparing {
-            ctx.request_repaint_after(Duration::from_millis(33));
+        let meters = (live && self.page == Page::Noise)
+            || (self.test_state.mic.is_some() && self.page == Page::Test);
+        if busy || meters || self.comparing {
+            ctx.request_repaint_after(METER_FRAME);
+        } else if live || self.test_state.mic.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(250));
         } else {
             ctx.request_repaint_after(SYNC_EVERY);
         }

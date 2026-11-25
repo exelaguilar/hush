@@ -9,9 +9,12 @@ use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
     SampleFormat, Stream, StreamConfig,
 };
-use std::sync::{
-    atomic::{AtomicBool, AtomicU32, Ordering},
-    Arc, Mutex,
+use std::{
+    cell::RefCell,
+    sync::{
+        atomic::{AtomicBool, AtomicU32, Ordering},
+        Arc, Mutex,
+    },
 };
 
 pub const RECORD_SECONDS: usize = 10;
@@ -71,7 +74,11 @@ impl Resampler {
 
 pub struct MicTest {
     _input: Stream,
-    _output: Stream,
+    /// Opened on first use (monitoring or playback), so a meter-only test
+    /// never touches the speakers.
+    output: RefCell<Option<Stream>>,
+    /// What opening the output needs: the monitor queue's reading end.
+    pending_output: RefCell<Option<rtrb::Consumer<f32>>>,
     shared: Arc<Shared>,
     input_rate: u32,
     pub output_name: String,
@@ -94,20 +101,8 @@ impl MicTest {
                 input_config.sample_format()
             ));
         }
-        let output = host
-            .default_output_device()
-            .ok_or_else(|| anyhow!("no playback device"))?;
-        let output_config = output.default_output_config()?;
-        if output_config.sample_format() != SampleFormat::F32 {
-            return Err(anyhow!(
-                "unsupported playback format {:?}",
-                output_config.sample_format()
-            ));
-        }
         let input_rate = input_config.sample_rate().0;
-        let output_rate = output_config.sample_rate().0;
         let in_channels = input_config.channels() as usize;
-        let out_channels = output_config.channels() as usize;
 
         let shared = Arc::new(Shared {
             peak: AtomicU32::new(0),
@@ -115,9 +110,8 @@ impl MicTest {
             recording: Mutex::new(Recording::default()),
             playback: Mutex::new(Playback::default()),
         });
-        let (mut to_monitor, mut monitor_queue) =
+        let (mut to_monitor, monitor_queue) =
             rtrb::RingBuffer::<f32>::new(input_rate as usize / 2);
-        let max_queue = input_rate as usize * MONITOR_MAX_QUEUE_MS / 1000;
 
         let input_shared = shared.clone();
         let input_config: StreamConfig = input_config.into();
@@ -147,7 +141,45 @@ impl MicTest {
             )
             .context("opening the microphone")?;
 
-        let output_shared = shared.clone();
+        input_stream.play()?;
+        // Only the name for now; the device is opened on first use.
+        let output_name = host
+            .default_output_device()
+            .and_then(|device| device.name().ok())
+            .unwrap_or_default();
+        Ok(Self {
+            _input: input_stream,
+            output: RefCell::new(None),
+            pending_output: RefCell::new(Some(monitor_queue)),
+            shared,
+            input_rate,
+            output_name,
+        })
+    }
+
+    /// Opens the default playback device for monitoring and playback, once.
+    fn open_output(&self) -> Result<()> {
+        if self.output.borrow().is_some() {
+            return Ok(());
+        }
+        let Some(mut monitor_queue) = self.pending_output.borrow_mut().take() else {
+            return Err(anyhow!("the playback device could not be opened"));
+        };
+        let output = cpal::default_host()
+            .default_output_device()
+            .ok_or_else(|| anyhow!("no playback device"))?;
+        let output_config = output.default_output_config()?;
+        if output_config.sample_format() != SampleFormat::F32 {
+            return Err(anyhow!(
+                "unsupported playback format {:?}",
+                output_config.sample_format()
+            ));
+        }
+        let input_rate = self.input_rate;
+        let output_rate = output_config.sample_rate().0;
+        let out_channels = output_config.channels() as usize;
+        let max_queue = input_rate as usize * MONITOR_MAX_QUEUE_MS / 1000;
+        let output_shared = self.shared.clone();
         let mut monitor_resampler = Resampler::new(input_rate, output_rate);
         let mut playback_resampler = Resampler::new(input_rate, output_rate);
         let output_config: StreamConfig = output_config.into();
@@ -192,16 +224,9 @@ impl MicTest {
                 None,
             )
             .context("opening the playback device")?;
-
-        input_stream.play()?;
         output_stream.play()?;
-        Ok(Self {
-            _input: input_stream,
-            _output: output_stream,
-            shared,
-            input_rate,
-            output_name: output.name().unwrap_or_default(),
-        })
+        *self.output.borrow_mut() = Some(output_stream);
+        Ok(())
     }
 
     /// Peak of the latest input buffer, 0..1.
@@ -209,8 +234,13 @@ impl MicTest {
         f32::from_bits(self.shared.peak.load(Ordering::Relaxed))
     }
 
-    pub fn set_monitor(&self, on: bool) {
+    /// Turns "hear myself" on or off (opening the speakers the first time).
+    pub fn set_monitor(&self, on: bool) -> Result<()> {
+        if on {
+            self.open_output()?;
+        }
         self.shared.monitor.store(on, Ordering::Relaxed);
+        Ok(())
     }
 
     pub fn start_recording(&self) {
@@ -242,12 +272,14 @@ impl MicTest {
         !self.shared.recording.lock().unwrap().samples.is_empty()
     }
 
-    pub fn play_recording(&self) {
+    pub fn play_recording(&self) -> Result<()> {
+        self.open_output()?;
         let samples = self.shared.recording.lock().unwrap().samples.clone();
         let mut playback = self.shared.playback.lock().unwrap();
         playback.samples = samples;
         playback.position = 0;
         playback.playing = true;
+        Ok(())
     }
 
     /// Saves the last recording as a WAV file in Documents\Hush Recordings

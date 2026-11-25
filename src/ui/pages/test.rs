@@ -94,7 +94,10 @@ impl HushApp {
                     |ui| {
                         if theme::switch(ui, &mut self.test_state.monitor, "Hear myself").changed()
                         {
-                            test.set_monitor(self.test_state.monitor);
+                            if let Err(error) = test.set_monitor(self.test_state.monitor) {
+                                self.test_state.monitor = false;
+                                self.test_state.error = Some(format!("{error:#}"));
+                            }
                         }
                     },
                 );
@@ -125,7 +128,9 @@ impl HushApp {
                                 )
                                 .clicked()
                             {
-                                test.play_recording();
+                                if let Err(error) = test.play_recording() {
+                                    self.test_state.error = Some(format!("{error:#}"));
+                                }
                             }
                             if test.has_recording() && theme::outline_button(ui, "Save").clicked() {
                                 saved = Some(test.save_recording().map_err(|e| format!("{e:#}")));

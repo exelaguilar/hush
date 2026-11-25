@@ -1,5 +1,34 @@
 # Changelog
 
+## 1.2.0
+
+**New**
+- Clean Mic reports its own CPU use. *About → Status* and *Copy
+  diagnostics* show it, for example *Clean Mic's CPU use: 2.4% of one core*,
+  measured inside the audio engine over the last second.
+- Optional *Clean Mic on/off hotkey* (Settings), off by default. It flips
+  Clean Mic from anywhere for a quick before and after in a call or game.
+
+**Fixes**
+- Apps using your microphone show their real names, such as *Apex Legends*
+  instead of *R5apex_dx12*. Hush uses the program's description, else its
+  window title, else its file name. This also applies to the "another
+  microphone" hint.
+- Uninstalling now also removes the notification identity and the `hush:`
+  link that opens Hush from a notification.
+- *Mic Test* only opens your speakers when you turn on *Hear myself* or
+  play back a recording.
+
+**Lighter**
+- The window draws live meters at 20 frames a second instead of 30, and
+  only on the pages that show meters (Noise & Gate, a running Mic Test).
+  Other pages update four times a second.
+- The plugin's helper thread inside the audio engine wakes 4 times a second
+  instead of 20 when no audio is flowing.
+
+**Behind the scenes**
+- The release workflow builds, tests and publishes in parallel jobs.
+
 ## 1.1.0
 
 **Much lighter in the tray**

@@ -180,6 +180,8 @@ pub struct AgentState {
     pub repair_note: Option<String>,
     /// Why the mute hotkey could not be registered.
     pub hotkey_error: Option<String>,
+    /// Why the Clean Mic hotkey could not be registered.
+    pub toggle_hotkey_error: Option<String>,
     /// Apps capturing from the watched microphone right now.
     pub apps: Vec<String>,
 }
@@ -199,13 +201,14 @@ impl AgentState {
             health => (health.id(), "", ""),
         };
         format!(
-            "health = {health}\nwrong_app = {}\nwrong_other = {}\ntarget = {}\nrepairing = {}\nrepair_note = {}\nhotkey_error = {}\napps = {}\n",
+            "health = {health}\nwrong_app = {}\nwrong_other = {}\ntarget = {}\nrepairing = {}\nrepair_note = {}\nhotkey_error = {}\ntoggle_hotkey_error = {}\napps = {}\n",
             one_line(app),
             one_line(other),
             one_line(&self.target),
             if self.repairing { "1" } else { "0" },
             one_line(self.repair_note.as_deref().unwrap_or("")),
             one_line(self.hotkey_error.as_deref().unwrap_or("")),
+            one_line(self.toggle_hotkey_error.as_deref().unwrap_or("")),
             self.apps.iter().map(|a| one_line(a).replace('|', " ")).collect::<Vec<_>>().join("|"),
         )
     }
@@ -228,6 +231,7 @@ impl AgentState {
                 "repairing" => state.repairing = value == "1",
                 "repair_note" => state.repair_note = some(value),
                 "hotkey_error" => state.hotkey_error = some(value),
+                "toggle_hotkey_error" => state.toggle_hotkey_error = some(value),
                 "apps" => {
                     state.apps = value
                         .split('|')
@@ -278,6 +282,7 @@ mod tests {
                 repairing: true,
                 repair_note: Some("The repair did not\nfinish in time.".into()),
                 hotkey_error: Some("Ctrl+Alt+M is in use".into()),
+                toggle_hotkey_error: Some("Pick a different key".into()),
                 apps: vec!["Discord".into(), "OBS".into()],
             },
             AgentState {

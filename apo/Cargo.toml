@@ -1,6 +1,6 @@
 ﻿[package]
 name = "hush-apo"
-version = "1.1.0"
+version = "1.2.0"
 edition = "2021"
 description = "Hush clean-mic Audio Processing Object (loaded by Windows' audio engine)"
 authors = ["Exel (https://exel.dev)"]

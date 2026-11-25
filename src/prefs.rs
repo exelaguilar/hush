@@ -15,7 +15,7 @@ const RUN_VALUE: &str = "Hush";
 /// Command-line flag used by the autostart entry.
 pub const MINIMIZED_FLAG: &str = "--minimized";
 
-/// Keys offered for the global mute hotkey.
+/// Keys offered for the global hotkeys (mute, Clean Mic on/off).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MuteKey {
     #[default]
@@ -90,6 +90,9 @@ pub struct Prefs {
     /// Global hotkey that mutes the microphone in every app.
     pub mute_hotkey: bool,
     pub mute_key: MuteKey,
+    /// Global hotkey that turns Clean Mic on and off (off by default).
+    pub toggle_hotkey: bool,
+    pub toggle_key: MuteKey,
     /// Put Clean Mic back automatically when a microphone reconnects without it.
     pub auto_repair: bool,
     /// Windows notifications about microphone health.
@@ -147,6 +150,8 @@ impl Default for Prefs {
             tray_hint_shown: false,
             mute_hotkey: false,
             mute_key: MuteKey::default(),
+            toggle_hotkey: false,
+            toggle_key: MuteKey::CtrlShiftM,
             auto_repair: true,
             notifications: true,
             window: None,
@@ -191,6 +196,12 @@ pub fn load() -> Prefs {
             "notifications" => prefs.notifications = flag(value).unwrap_or(prefs.notifications),
             "mute_key" => prefs.mute_key = MuteKey::from_id(value).unwrap_or(prefs.mute_key),
             "window" => prefs.window = WindowRect::from_id(value),
+            "clean_mic_hotkey" => {
+                prefs.toggle_hotkey = flag(value).unwrap_or(prefs.toggle_hotkey)
+            }
+            "clean_mic_key" => {
+                prefs.toggle_key = MuteKey::from_id(value).unwrap_or(prefs.toggle_key)
+            }
             _ => {}
         }
     }
@@ -212,6 +223,11 @@ pub fn save(prefs: &Prefs) -> std::io::Result<()> {
         on(prefs.auto_repair),
         on(prefs.notifications)
     );
+    text.push_str(&format!(
+        "clean_mic_hotkey = {}\nclean_mic_key = {}\n",
+        on(prefs.toggle_hotkey),
+        prefs.toggle_key.id()
+    ));
     if let Some(window) = prefs.window {
         text.push_str(&format!("window = {}\n", window.id()));
     }

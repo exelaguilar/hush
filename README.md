@@ -69,7 +69,7 @@ and puts it back on its own, then tells you it did.
 | **Voice that sounds like you, only better** | Natural, Warm and Broadcast presets, plus Bass, Clarity and Air, a de-esser and a pop filter. |
 | **Desk-mic mode** | Tell Hush the mic sits on your desk, and it boosts more and protects softer word endings. |
 | **Mic Test** | Hear yourself exactly as others do, hold a button to hear the original, and record a 10-second take. |
-| **Mute hotkey** | Optional. One key mutes your mic in every app, and the tray shows the state. |
+| **Hotkeys** | Optional. One key mutes your mic in every app, another turns Clean Mic on and off for a quick before and after. The tray shows the state. |
 | **Level warnings** | Hush tells you when your mic is clipping or too quiet to clean well. |
 | **Microphone health watch** | Notices a disconnected mic, or Clean Mic going missing after a replug, and repairs it without an administrator prompt. |
 | **Your settings, portable** | Save and restore a snapshot of your tuning, or export and import it as a file. |
@@ -128,7 +128,7 @@ Hush wasn't thrown together. Every release went through the same process:
 - **No accidental changes.** Unchanged settings must reproduce the previous
   release's sound byte for byte, so a code change can't quietly change how
   you sound.
-- **94 automated tests** run on every push. Failure paths were tested by
+- **99 automated tests** run on every push. Failure paths were tested by
   deliberately crashing them: if processing ever fails, your mic keeps
   working unprocessed instead of taking Windows audio down with it.
 - **Used daily on real PCs** in Discord calls and games.

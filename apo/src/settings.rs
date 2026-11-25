@@ -433,6 +433,9 @@ pub struct EngineStatus {
     pub underruns: u64,
     /// Samples skipped to keep latency bounded.
     pub skipped: u64,
+    /// Clean Mic's own CPU use over the last second, in tenths of a percent
+    /// of one core (denoiser thread plus audio callback).
+    pub cpu_permille: Option<u32>,
 }
 
 pub fn parse_status(text: &str) -> Option<EngineStatus> {
@@ -444,6 +447,7 @@ pub fn parse_status(text: &str) -> Option<EngineStatus> {
         updated_unix: 0,
         underruns: 0,
         skipped: 0,
+        cpu_permille: None,
     };
     let mut seen = false;
     for line in text.lines() {
@@ -458,6 +462,8 @@ pub fn parse_status(text: &str) -> Option<EngineStatus> {
             "channels" => status.channels = value.parse().ok()?,
             "underruns" => status.underruns = value.parse().ok()?,
             "skipped" => status.skipped = value.parse().ok()?,
+            // Optional and newer: a bad value is ignored, not fatal.
+            "cpu_permille" => status.cpu_permille = value.parse().ok(),
             "updated_unix" => {
                 status.updated_unix = value.parse().ok()?;
                 seen = true;
@@ -468,7 +474,40 @@ pub fn parse_status(text: &str) -> Option<EngineStatus> {
     seen.then_some(status)
 }
 
-fn write_status() {
+/// CPU time used by Clean Mic, for the status file: the denoiser worker
+/// thread (updated by the worker) and the audio callback (timed per buffer).
+pub static WORKER_CPU_NS: AtomicU64 = AtomicU64::new(0);
+pub static CALLBACK_NS: AtomicU64 = AtomicU64::new(0);
+
+/// Called from the real-time thread with the time one buffer took.
+pub fn record_callback_time(elapsed: Duration) {
+    CALLBACK_NS.fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
+}
+
+/// Turns two readings of the CPU counters into a load figure.
+struct CpuMeter {
+    last: Option<(Instant, u64)>,
+}
+
+impl CpuMeter {
+    /// Tenths of a percent of one core since the previous call.
+    fn sample(&mut self, now: Instant) -> Option<u32> {
+        let total = WORKER_CPU_NS.load(Ordering::Relaxed) + CALLBACK_NS.load(Ordering::Relaxed);
+        self.sample_total(now, total)
+    }
+
+    fn sample_total(&mut self, now: Instant, total: u64) -> Option<u32> {
+        let previous = self.last.replace((now, total));
+        let (at, before) = previous?;
+        let wall = now.duration_since(at).as_nanos() as u64;
+        (wall > 0).then(|| (total.saturating_sub(before) * 1000 / wall) as u32)
+    }
+}
+
+fn write_status(cpu_permille: Option<u32>) {
+    let cpu_line = cpu_permille
+        .map(|value| format!("cpu_permille = {value}\n"))
+        .unwrap_or_default();
     let text = format!(
         "# Written by the Hush APO inside audiodg.exe\n\
          process_id = {}\n\
@@ -477,14 +516,16 @@ fn write_status() {
          channels = {}\n\
          updated_unix = {}\n\
          underruns = {}\n\
-         skipped = {}\n",
+         skipped = {}\n\
+         {}",
         std::process::id(),
         PROCESSED_FRAMES.load(Ordering::Relaxed),
         STREAM_RATE.load(Ordering::Relaxed),
         STREAM_CHANNELS.load(Ordering::Relaxed),
         unix_seconds(),
         crate::denoise::UNDERRUNS.load(Ordering::Relaxed),
-        crate::denoise::SKIPPED.load(Ordering::Relaxed)
+        crate::denoise::SKIPPED.load(Ordering::Relaxed),
+        cpu_line
     );
     // Best effort: write to a temp file and rename so readers never see a
     // half-written file.
@@ -499,6 +540,14 @@ fn write_status() {
     }
 }
 
+const LIVE_TICK: Duration = Duration::from_millis(50);
+const IDLE_TICK: Duration = Duration::from_millis(250);
+/// No audio for this long counts as idle.
+const IDLE_AFTER: Duration = Duration::from_secs(2);
+const SETTINGS_TICK: Duration = Duration::from_millis(250);
+const STATUS_TICK: Duration = Duration::from_secs(1);
+const HEARTBEAT: Duration = Duration::from_secs(30);
+
 /// Starts (once per process) the thread that keeps [`current`] in sync with
 /// the settings file and publishes `status.txt`. If the settings file is
 /// missing, defaults apply.
@@ -508,7 +557,6 @@ pub fn start_watcher() {
         let path = settings_path();
         let mut last: Option<SystemTime> = None;
         let mut last_frames = u64::MAX;
-        let mut ticks = 0_u32;
         let mut load = move || {
             if let Some(settings) = load_if_changed(&path, &mut last, |path| {
                 std::fs::read_to_string(path)
@@ -522,15 +570,24 @@ pub fn start_watcher() {
             .spawn(move || {
                 let mut live = LiveWriter::open();
                 let mut live_frames = u64::MAX;
+                let now = Instant::now();
+                let (mut next_settings, mut next_status) = (now, now);
+                let mut next_heartbeat = now + HEARTBEAT;
+                let mut idle_since: Option<Instant> = None;
+                let mut cpu = CpuMeter { last: None };
                 loop {
-                    // 20 Hz: live meter; 4 Hz: settings; 1 Hz: status file
-                    // (only while audio flows, plus a heartbeat every ~30 s).
-                    std::thread::sleep(Duration::from_millis(50));
-                    ticks = ticks.wrapping_add(1);
+                    // While audio flows: live meter at 20 Hz. With no audio
+                    // for a while the thread wakes only 4 times a second.
+                    // Settings: 4 Hz. Status file: 1 Hz while audio flows,
+                    // plus a heartbeat every 30 s.
+                    let idle = idle_since.is_some_and(|since| since.elapsed() >= IDLE_AFTER);
+                    std::thread::sleep(if idle { IDLE_TICK } else { LIVE_TICK });
+                    let now = Instant::now();
                     let frames = PROCESSED_FRAMES.load(Ordering::Relaxed);
-                    if let Some(live) = live.as_mut() {
-                        if frames != live_frames {
-                            live_frames = frames;
+                    if frames != live_frames {
+                        live_frames = frames;
+                        idle_since = None;
+                        if let Some(live) = live.as_mut() {
                             live.write(&LiveLevels {
                                 input: f32::from_bits(IN_PEAK.swap(0, Ordering::Relaxed)),
                                 output: f32::from_bits(OUT_PEAK.swap(0, Ordering::Relaxed)),
@@ -538,8 +595,11 @@ pub fn start_watcher() {
                                 updated_ms: unix_millis(),
                             });
                         }
+                    } else {
+                        idle_since.get_or_insert(now);
                     }
-                    if ticks.is_multiple_of(5) {
+                    if now >= next_settings {
+                        next_settings = now + SETTINGS_TICK;
                         load();
                     }
                     if FAULTED.swap(false, Ordering::Relaxed) {
@@ -552,11 +612,16 @@ pub fn start_watcher() {
                             "Denoiser worker stalled or failed; this stream now passes microphone input through",
                         );
                     }
-                    if ticks.is_multiple_of(20)
-                        && (frames != last_frames || ticks.is_multiple_of(600))
-                    {
-                        last_frames = frames;
-                        write_status();
+                    if now >= next_status {
+                        next_status = now + STATUS_TICK;
+                        let flowing = frames != last_frames;
+                        // Measured over the last second while audio flows.
+                        let load = cpu.sample(now).filter(|_| flowing);
+                        if flowing || now >= next_heartbeat {
+                            last_frames = frames;
+                            next_heartbeat = now + HEARTBEAT;
+                            write_status(load);
+                        }
                     }
                 }
             });
@@ -824,7 +889,29 @@ mod tests {
         assert_eq!(status.processed_frames, 480_000);
         assert_eq!(status.rate, 48_000);
         assert_eq!(status.channels, 2);
+        assert_eq!(status.cpu_permille, None);
         assert!(parse_status("garbage").is_none());
+    }
+
+    #[test]
+    fn status_cpu_is_optional_and_lenient() {
+        let base = "process_id = 1\nupdated_unix = 5\n";
+        let with_cpu = parse_status(&format!("{base}cpu_permille = 23\n")).unwrap();
+        assert_eq!(with_cpu.cpu_permille, Some(23));
+        // A broken value is dropped, the rest of the status still counts.
+        let broken = parse_status(&format!("{base}cpu_permille = lots\n")).unwrap();
+        assert_eq!(broken.cpu_permille, None);
+        assert_eq!(broken.process_id, 1);
+    }
+
+    #[test]
+    fn cpu_meter_reports_tenths_of_a_percent() {
+        let mut meter = CpuMeter { last: None };
+        let start = Instant::now();
+        assert_eq!(meter.sample_total(start, 1_000), None);
+        // 25 ms of CPU over one second is 2.5% of a core.
+        let load = meter.sample_total(start + Duration::from_secs(1), 1_000 + 25_000_000);
+        assert_eq!(load, Some(25));
     }
 
     #[test]

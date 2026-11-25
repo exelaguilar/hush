@@ -9,6 +9,8 @@
 #[cfg(windows)]
 mod agent;
 #[cfg(windows)]
+mod app_names;
+#[cfg(windows)]
 mod clipboard;
 #[cfg(windows)]
 mod dev;

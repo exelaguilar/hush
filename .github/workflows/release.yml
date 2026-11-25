@@ -17,17 +17,24 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_PROFILE_RELEASE_BUILD_OVERRIDE_OPT_LEVEL: "3"
 
+# The release build and the tests run in parallel (each with its own
+# cache, like CI); the release is published only when both pass.
 jobs:
-  release:
+  build:
     runs-on: windows-latest
     timeout-minutes: 60
     defaults:
       run:
         shell: bash
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      hash: ${{ steps.package.outputs.hash }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: release
 
       - name: Check the tag matches Cargo.toml
         id: version
@@ -48,13 +55,11 @@ jobs:
           SM_PAYLOAD_DIR: ${{ github.workspace }}\target\release
         run: cargo build --release -p hush-installer
 
-      - name: Test
+      - name: Test installer
         env:
           SM_PAYLOAD_DIR: ${{ github.workspace }}\target\release
           __COMPAT_LAYER: RunAsInvoker
-        run: |
-          cargo test --workspace --exclude hush-installer --all-targets
-          cargo test --release -p hush-installer
+        run: cargo test --release -p hush-installer
 
       - name: Package and checksum
         id: package
@@ -69,10 +74,41 @@ jobs:
           echo "hash=$hash" >> "$GITHUB_OUTPUT"
           ls -l dist
 
+      - uses: actions/upload-artifact@v4
+        with:
+          name: installer
+          path: dist/
+          if-no-files-found: error
+
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: test
+
+      - name: Test workspace
+        run: cargo test --workspace --exclude hush-installer --all-targets
+
+  publish:
+    needs: [build, test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: installer
+          path: dist/
+
       - name: Release notes from CHANGELOG.md
         env:
-          VERSION: ${{ steps.version.outputs.version }}
-          HASH: ${{ steps.package.outputs.hash }}
+          VERSION: ${{ needs.build.outputs.version }}
+          HASH: ${{ needs.build.outputs.hash }}
         run: |
           # Take the "## <version>" section, stop at the next "## ", and join
           # hard-wrapped continuation lines (two leading spaces) to their bullet.
@@ -98,7 +134,7 @@ jobs:
       - name: Create or update the GitHub release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          VERSION: ${{ steps.version.outputs.version }}
+          VERSION: ${{ needs.build.outputs.version }}
         run: |
           files=("dist/Hush-Setup-$VERSION.exe" "dist/Hush-Setup-$VERSION.sha256")
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then

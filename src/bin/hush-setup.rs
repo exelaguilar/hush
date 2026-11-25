@@ -1432,6 +1432,17 @@ mod windows_main {
         if let Some(appdata) = std::env::var_os("APPDATA") {
             let _ = fs::remove_dir_all(PathBuf::from(appdata).join("Hush"));
         }
+        // The notification identity and the `hush:` link that opens Hush
+        // from a clicked notification (written by the app, see notify.rs).
+        let hkcu = winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER);
+        for key in [
+            r"Software\Classes\hush",
+            r"Software\Classes\AppUserModelId\Exel.Hush",
+        ] {
+            if hkcu.delete_subkey_all(key).is_ok() {
+                out.line(format!("  removed HKCU\\{key}"));
+            }
+        }
         if hklm().delete_subkey_all(UNINSTALL_KEY).is_ok() {
             out.line("  removed Installed apps entry");
         }

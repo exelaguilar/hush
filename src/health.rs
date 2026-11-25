@@ -15,25 +15,20 @@ use hush_apo::settings;
 use std::{
     collections::{hash_map::DefaultHasher, HashMap, VecDeque},
     hash::{Hash, Hasher},
-    path::Path,
     sync::mpsc,
     time::{Duration, Instant, SystemTime},
 };
 use windows::{
-    core::{implement, Interface, HSTRING, PCWSTR, PWSTR},
+    core::{implement, Interface, HSTRING, PCWSTR},
     Win32::{
-        Foundation::{CloseHandle, PROPERTYKEY},
+        Foundation::PROPERTYKEY,
         Media::Audio::{
             eCapture, AudioSessionStateActive, EDataFlow, ERole, IAudioSessionControl2,
             IAudioSessionManager2, IMMDeviceEnumerator, IMMNotificationClient,
             IMMNotificationClient_Impl, MMDeviceEnumerator, DEVICE_STATE,
         },
-        System::{
-            Com::{CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL, COINIT_MULTITHREADED},
-            Threading::{
-                OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
-                PROCESS_QUERY_LIMITED_INFORMATION,
-            },
+        System::Com::{
+            CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL, COINIT_MULTITHREADED,
         },
     },
 };
@@ -466,7 +461,7 @@ struct ProbeCache {
     recorded: Vec<(String, String)>,
     scanned: Option<Instant>,
     managers: HashMap<String, IAudioSessionManager2>,
-    names: HashMap<u32, String>,
+    names: HashMap<u32, Option<String>>,
 }
 
 /// Safety-net rescan of the endpoint registry when no event arrived.
@@ -495,13 +490,14 @@ impl ProbeCache {
         self.managers.retain(|id, _| active.contains(&id.as_str()));
     }
 
-    fn name(&mut self, pid: u32) -> String {
+    /// Display name of a process (`None` for Hush itself), looked up once.
+    fn label(&mut self, pid: u32) -> Option<String> {
         if self.names.len() > 64 {
             self.names.clear();
         }
         self.names
             .entry(pid)
-            .or_insert_with(|| process_name(pid))
+            .or_insert_with(|| crate::app_names::label(pid))
             .clone()
     }
 
@@ -546,61 +542,6 @@ impl ProbeCache {
     }
 }
 
-/// "chrome" from a process id.
-fn process_name(pid: u32) -> String {
-    if pid == 0 {
-        return "An app".into();
-    }
-    unsafe {
-        let Ok(handle) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
-            return "An app".into();
-        };
-        let mut buffer = [0_u16; 520];
-        let mut len = buffer.len() as u32;
-        let ok = QueryFullProcessImageNameW(
-            handle,
-            PROCESS_NAME_WIN32,
-            PWSTR(buffer.as_mut_ptr()),
-            &mut len,
-        )
-        .is_ok();
-        let _ = CloseHandle(handle);
-        if !ok {
-            return "An app".into();
-        }
-        let path = String::from_utf16_lossy(&buffer[..len as usize]);
-        Path::new(&path)
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "An app".into())
-    }
-}
-
-/// Display name for a process name ("obs64" -> "OBS"). `None` for Hush
-/// itself, whose Mic Test is not "an app using the mic".
-pub fn app_label(process: &str) -> Option<String> {
-    let lower = process.to_ascii_lowercase();
-    let known = match lower.as_str() {
-        "hush" => return None,
-        "obs64" | "obs32" | "obs" => "OBS",
-        "msedge" | "msedgewebview2" => "Edge",
-        "ms-teams" | "teams" => "Teams",
-        "steamwebhelper" | "steam" => "Steam",
-        "zoom" => "Zoom",
-        "firefox" => "Firefox",
-        "chrome" => "Chrome",
-        "discord" | "discordptb" | "discordcanary" => "Discord",
-        _ => "",
-    };
-    if !known.is_empty() {
-        return Some(known.to_string());
-    }
-    let mut chars = process.chars();
-    chars
-        .next()
-        .map(|first| first.to_uppercase().chain(chars).collect())
-}
-
 fn probe(enumerator: &IMMDeviceEnumerator, mic: &str, cache: &mut ProbeCache) -> Probe {
     let mut probe = Probe::default();
     cache.refresh();
@@ -633,7 +574,7 @@ fn probe(enumerator: &IMMDeviceEnumerator, mic: &str, cache: &mut ProbeCache) ->
                 if *pid == own {
                     continue;
                 }
-                if let Some(label) = app_label(&cache.name(*pid)) {
+                if let Some(label) = cache.label(*pid) {
                     if !probe.apps.contains(&label) {
                         probe.apps.push(label);
                     }
@@ -641,8 +582,12 @@ fn probe(enumerator: &IMMDeviceEnumerator, mic: &str, cache: &mut ProbeCache) ->
             }
             keys.extend(pids);
         } else if probe.capture_other.is_none() {
-            if let Some(pid) = pids.into_iter().find(|pid| *pid != own) {
-                probe.capture_other = Some((cache.name(pid), name.clone()));
+            let other = pids
+                .into_iter()
+                .filter(|pid| *pid != own)
+                .find_map(|pid| cache.label(pid));
+            if let Some(app) = other {
+                probe.capture_other = Some((app, name.clone()));
             }
         }
     }
@@ -1207,14 +1152,5 @@ mod tests {
         assert_eq!(file.result, "repaired");
         assert_eq!(file.message, "Done it.");
         assert_eq!(parse_repair("nothing useful"), None);
-    }
-
-    #[test]
-    fn app_labels_are_friendly_and_skip_hush() {
-        assert_eq!(app_label("obs64").as_deref(), Some("OBS"));
-        assert_eq!(app_label("Discord").as_deref(), Some("Discord"));
-        assert_eq!(app_label("vrchat").as_deref(), Some("Vrchat"));
-        assert_eq!(app_label("hush"), None);
-        assert_eq!(app_label(""), None);
     }
 }

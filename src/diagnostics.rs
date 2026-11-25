@@ -60,6 +60,14 @@ pub fn text(report: &Report) -> String {
             let _ = writeln!(out, "Engine channels: {}", status.channels);
             let _ = writeln!(out, "Engine underruns: {}", status.underruns);
             let _ = writeln!(out, "Engine skipped samples: {}", status.skipped);
+            if let Some(permille) = status.cpu_permille {
+                let _ = writeln!(
+                    out,
+                    "Clean Mic CPU: {}.{}% of one core",
+                    permille / 10,
+                    permille % 10
+                );
+            }
             let _ = writeln!(
                 out,
                 "Engine last update: {} s ago",

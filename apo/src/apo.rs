@@ -375,6 +375,7 @@ impl Core {
 
         #[cfg(target_arch = "x86_64")]
         let _ftz = FlushDenormals::enable();
+        let started = std::time::Instant::now();
 
         unsafe {
             let valid = !source.is_null() && input.u32BufferFlags == BUFFER_VALID;
@@ -423,6 +424,7 @@ impl Core {
             }
         }
         settings::record_processed(frames, state.rate, state.channels as u32);
+        settings::record_callback_time(started.elapsed());
         output.u32ValidFrameCount = frames;
         // Even after silent input the delayed tail may still carry audio.
         output.u32BufferFlags = BUFFER_VALID;

@@ -779,6 +779,43 @@ struct Shared {
 /// Raises the worker to MMCSS "Pro Audio" scheduling so busy systems (games)
 /// do not starve it; reverted when the thread ends.
 #[cfg(windows)]
+/// Adds this thread's CPU time since the last call to the status counter.
+fn publish_worker_cpu() {
+    thread_local! {
+        static LAST: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+    let Some(total) = thread_cpu_ns() else {
+        return;
+    };
+    let last = LAST.with(|last| last.replace(total));
+    if last > 0 {
+        crate::settings::WORKER_CPU_NS.fetch_add(total.saturating_sub(last), Ordering::Relaxed);
+    }
+}
+
+/// Kernel plus user time of the calling thread.
+#[cfg(windows)]
+fn thread_cpu_ns() -> Option<u64> {
+    use windows::Win32::{Foundation::FILETIME, System::Threading::{GetCurrentThread, GetThreadTimes}};
+    let (mut created, mut exited, mut kernel, mut user) = (
+        FILETIME::default(),
+        FILETIME::default(),
+        FILETIME::default(),
+        FILETIME::default(),
+    );
+    unsafe {
+        GetThreadTimes(GetCurrentThread(), &mut created, &mut exited, &mut kernel, &mut user).ok()?;
+    }
+    let ticks = |t: FILETIME| ((t.dwHighDateTime as u64) << 32) | t.dwLowDateTime as u64;
+    // FILETIME counts 100 ns units.
+    Some((ticks(kernel) + ticks(user)) * 100)
+}
+
+#[cfg(not(windows))]
+fn thread_cpu_ns() -> Option<u64> {
+    None
+}
+
 struct ProAudioPriority(Option<windows::Win32::Foundation::HANDLE>);
 
 #[cfg(windows)]
@@ -866,7 +903,12 @@ impl ThreadedDenoiser {
                         return Err("model or resampler unavailable");
                     }
                     worker_shared.state.store(READY, Ordering::Release);
+                    let mut cpu_checked = std::time::Instant::now();
                     while !worker_shared.stop.load(Ordering::Acquire) {
+                        if cpu_checked.elapsed() >= Duration::from_millis(500) {
+                            cpu_checked = std::time::Instant::now();
+                            publish_worker_cpu();
+                        }
                         let available = worker_in.slots();
                         if available == 0 {
                             std::thread::sleep(Duration::from_millis(1));

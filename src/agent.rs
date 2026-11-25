@@ -15,7 +15,10 @@ use crate::{
 };
 use hush_apo::settings;
 use std::{
-    sync::{mpsc, Arc},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc,
+    },
     time::{Duration, Instant, SystemTime},
 };
 use windows::Win32::{
@@ -52,6 +55,12 @@ struct Agent {
     mute_mic: String,
     hotkey: Option<mute::Hotkey>,
     hotkey_error: Option<String>,
+    /// Optional hotkey that turns Clean Mic on and off.
+    toggle_hotkey: Option<mute::Hotkey>,
+    toggle_error: Option<String>,
+    /// Set on the hotkey thread; the main loop does the toggle.
+    toggle_pressed: Arc<AtomicBool>,
+    wake: Arc<dyn Fn() + Send + Sync>,
     live: settings::LiveReader,
     health: Health,
     published: Option<ipc::AgentState>,
@@ -91,6 +100,7 @@ impl Agent {
         let watch = health::Watcher::new(&target, wake.clone());
         // Toast identity (name, icon, click handler) for notifications.
         std::thread::spawn(notify::register);
+        let wake_for_toggle = wake.clone();
         let tray = Tray::new(settings.enabled, false, wake);
         let mut agent = Self {
             enabled: settings.enabled,
@@ -104,6 +114,10 @@ impl Agent {
             mute_mic,
             hotkey: None,
             hotkey_error: None,
+            toggle_hotkey: None,
+            toggle_error: None,
+            toggle_pressed: Arc::new(AtomicBool::new(false)),
+            wake: Arc::new(wake_for_toggle),
             live: settings::LiveReader::new(),
             health: Health {
                 watch,
@@ -122,15 +136,33 @@ impl Agent {
         agent
     }
 
-    /// (Re)registers the global mute hotkey to match the preferences.
+    /// (Re)registers the global hotkeys to match the preferences.
     fn apply_hotkey(&mut self) {
         // Unregister first so a changed key never leaves the old one active.
         self.hotkey = None;
         self.hotkey_error = None;
+        self.toggle_hotkey = None;
+        self.toggle_error = None;
         if self.prefs.mute_hotkey {
             match mute::Hotkey::register(self.prefs.mute_key, self.mute.toggler()) {
                 Ok(hotkey) => self.hotkey = Some(hotkey),
                 Err(error) => self.hotkey_error = Some(error),
+            }
+        }
+        if self.prefs.toggle_hotkey {
+            if self.prefs.mute_hotkey && self.prefs.toggle_key == self.prefs.mute_key {
+                self.toggle_error = Some("The mute hotkey already uses that key.".into());
+                return;
+            }
+            let pressed = self.toggle_pressed.clone();
+            let wake = self.wake.clone();
+            let on_press = move || {
+                pressed.store(true, Ordering::Release);
+                wake();
+            };
+            match mute::Hotkey::register(self.prefs.toggle_key, on_press) {
+                Ok(hotkey) => self.toggle_hotkey = Some(hotkey),
+                Err(error) => self.toggle_error = Some(error),
             }
         }
     }
@@ -139,7 +171,9 @@ impl Agent {
         self.prefs_mtime = mtime(&prefs::path());
         let loaded = prefs::load();
         let hotkey_changed = loaded.mute_hotkey != self.prefs.mute_hotkey
-            || loaded.mute_key != self.prefs.mute_key;
+            || loaded.mute_key != self.prefs.mute_key
+            || loaded.toggle_hotkey != self.prefs.toggle_hotkey
+            || loaded.toggle_key != self.prefs.toggle_key;
         self.prefs = loaded;
         if hotkey_changed {
             self.apply_hotkey();
@@ -306,6 +340,7 @@ impl Agent {
             repairing: self.health.repair_job.is_some(),
             repair_note: self.health.repair_note.clone(),
             hotkey_error: self.hotkey_error.clone(),
+            toggle_hotkey_error: self.toggle_error.clone(),
             apps: self
                 .health
                 .probe
@@ -339,6 +374,9 @@ impl Agent {
 
     fn tick(&mut self) {
         self.handle_tray();
+        if self.toggle_pressed.swap(false, Ordering::AcqRel) {
+            self.toggle_clean_mic();
+        }
         let settings_mtime = mtime(&settings::settings_path());
         if settings_mtime != self.settings_mtime {
             self.settings_mtime = settings_mtime;
