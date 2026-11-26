@@ -7,6 +7,19 @@
 #[cfg(not(windows))]
 fn main() {}
 
+#[cfg(windows)]
+#[path = "../../src/machine_state.rs"]
+#[allow(dead_code)]
+mod machine_state;
+
+#[cfg(windows)]
+#[path = "../../src/device_registry.rs"]
+mod device_registry;
+
+#[cfg(windows)]
+#[path = "../../src/virtual_output.rs"]
+mod virtual_output;
+
 /// The embedded payload: each file is brotli-compressed by build.rs behind
 /// an 8-byte little-endian header that holds the original length.
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -31,9 +44,17 @@ mod payload {
     }
 
     pub fn unpack(blob: &[u8]) -> Result<Vec<u8>, String> {
+        use std::io::Read;
         let (len, body) = decode_header(blob).ok_or("installer payload is corrupt")?;
-        let mut out = Vec::with_capacity(len);
-        brotli::BrotliDecompress(&mut &body[..], &mut out)
+        if len > 128 * 1024 * 1024 {
+            return Err("installer payload is too large".into());
+        }
+        let mut out = Vec::new();
+        out.try_reserve_exact(len)
+            .map_err(|error| error.to_string())?;
+        brotli_decompressor::Decompressor::new(body, 4096)
+            .take(len as u64 + 1)
+            .read_to_end(&mut out)
             .map_err(|e| format!("installer payload is corrupt: {e}"))?;
         if out.len() != len {
             return Err(format!(
@@ -59,7 +80,9 @@ mod payload {
 
         #[test]
         fn round_trips() {
-            let data: Vec<u8> = (0..100_000u32).map(|i| (i.wrapping_mul(i) >> 5) as u8).collect();
+            let data: Vec<u8> = (0..100_000u32)
+                .map(|i| (i.wrapping_mul(i) >> 5) as u8)
+                .collect();
             let packed = pack(&data);
             assert!(packed.len() < data.len());
             assert_eq!(super::unpack(&packed).unwrap(), data);
@@ -77,14 +100,19 @@ mod payload {
         }
 
         #[test]
-        fn embedded_payload_matches_headers() {
-            for blob in [
-                super::super::PAYLOAD_APP,
-                super::super::PAYLOAD_SETUP,
-                super::super::PAYLOAD_APO,
+        fn embedded_payload_matches_fresh_binaries() {
+            let dir = std::path::Path::new(env!("HUSH_PAYLOAD_DIR"));
+            for (name, bytes) in [
+                ("hush.exe", super::super::PAYLOAD_APP),
+                ("hush-setup.exe", super::super::PAYLOAD_SETUP),
+                ("hush_apo.dll", super::super::PAYLOAD_APO),
             ] {
-                let blob = super::super::payload::Blob(blob);
-                assert_eq!(blob.unpack().unwrap().len(), blob.len());
+                let actual = super::unpack(bytes).unwrap();
+                let expected = std::fs::read(dir.join(name)).unwrap();
+                assert!(
+                    actual == expected,
+                    "embedded {name} differs from the fresh build"
+                );
             }
         }
     }
@@ -155,7 +183,7 @@ mod install {
         sync::{Arc, Mutex},
     };
     use winreg::{
-        enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ},
+        enums::{HKEY_LOCAL_MACHINE, KEY_READ},
         RegKey,
     };
 
@@ -195,56 +223,22 @@ mod install {
         Ok(program_files()?.join("Hush"))
     }
 
-    fn data_dir() -> PathBuf {
-        std::env::var_os("ProgramData")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
+    fn data_dir() -> std::io::Result<PathBuf> {
+        crate::windows_setup_paths::program_data()
     }
 
     pub fn has_saved_mic_settings() -> bool {
-        let data = data_dir();
+        let Ok(data) = data_dir() else {
+            return false;
+        };
         data.join(r"Hush\mic.conf").is_file()
             || (program_files()
                 .is_ok_and(|root| root.join(r"SteelMixer\steelmixer-setup.exe").is_file())
                 && data.join(r"SteelMixer\mic.conf").is_file())
     }
 
-    fn save_mic_position(desk_mic: bool) -> std::io::Result<()> {
-        // The setup helper has already created the file and the app is closed.
-        // Preserve the rest of the file, including keys from other versions.
-        let path = data_dir().join(r"Hush\mic.conf");
-        let text = fs::read_to_string(&path)?;
-        let mut updated: String = text
-            .split_inclusive('\n')
-            .filter(|line| {
-                !line
-                    .split_once('=')
-                    .is_some_and(|(key, _)| key.trim() == "desk_mic")
-            })
-            .collect();
-        if !updated.is_empty() && !updated.ends_with('\n') {
-            updated.push('\n');
-        }
-        updated.push_str(if desk_mic {
-            "desk_mic = on\n"
-        } else {
-            "desk_mic = off\n"
-        });
-        if updated != text {
-            write_file(&path, updated.as_bytes())?;
-        }
-        Ok(())
-    }
-
     pub fn start_with_windows_default() -> bool {
-        if program_dir().is_ok_and(|dir| dir.join("hush.exe").is_file()) {
-            RegKey::predef(HKEY_CURRENT_USER)
-                .open_subkey_with_flags(r"Software\Microsoft\Windows\CurrentVersion\Run", KEY_READ)
-                .and_then(|run| run.get_value::<String, _>("Hush"))
-                .is_ok()
-        } else {
-            true
-        }
+        crate::machine_state::read("StartOnFirstLaunch").is_ok_and(|choice| choice == "1")
     }
 
     /// Active physical microphones by friendly name (virtual devices from
@@ -259,7 +253,7 @@ mod install {
             return Vec::new();
         };
         let attached =
-            fs::read_to_string(data_dir().join(r"Hush\installed.txt")).unwrap_or_default();
+            crate::machine_state::read(crate::machine_state::INSTALL_RECORD).unwrap_or_default();
         let mut mics: Vec<(bool, Microphone)> = Vec::new();
         for id in root.enum_keys().flatten() {
             let Ok(key) = root.open_subkey_with_flags(&id, KEY_READ) else {
@@ -271,28 +265,25 @@ mod install {
             let Ok(props) = key.open_subkey_with_flags("Properties", KEY_READ) else {
                 continue;
             };
-            let short: String = props
-                .get_value("{a45c254e-df1c-4efd-8020-67d146a850e0},2")
-                .unwrap_or_default();
-            let description: String = props
-                .get_value("{b3f8fa53-0004-438e-9003-51a46e139bfc},6")
-                .unwrap_or_default();
-            let name = if description.is_empty() {
-                short
-            } else {
-                format!("{short} ({description})")
+            let Some(name) = crate::device_registry::label(&props) else {
+                continue;
             };
-            let lower = name.to_lowercase();
-            if ["sonar", "vb-audio", "cable", "voicemeeter", "hush"]
-                .iter()
-                .any(|v| lower.contains(v))
+            if crate::virtual_output::is_third_party_virtual_endpoint(&name)
+                || crate::virtual_output::is_hush_virtual_input(&name)
+                || crate::virtual_output::is_hush_virtual_output(&name)
             {
                 continue;
             }
             mics.push((
                 attached
                     .lines()
-                    .any(|line| line.split('\t').nth(1) == Some(&id)),
+                    .any(|line| line.split('\t').nth(1) == Some(&id))
+                    || matches!(
+                        crate::device_registry::effect(&key),
+                        crate::device_registry::Effect::Ready
+                            | crate::device_registry::Effect::MissingModes
+                            | crate::device_registry::Effect::Conflict
+                    ),
                 Microphone { id, name },
             ));
         }
@@ -326,18 +317,44 @@ mod install {
         replace_file(path, |file| file.write_all(bytes))
     }
 
-    fn audio(log_to: &Log, start: bool) -> Result<(), String> {
-        let (verb, service) = if start {
-            ("start", "audiosrv")
-        } else {
-            ("stop", "audioendpointbuilder")
-        };
-        let mut command = system_tool("net.exe").map_err(|e| e.to_string())?;
-        command.args([verb, service]);
-        if !start {
-            command.arg("/y");
+    fn replace_program_files(dir: &Path, files: &[(&str, &[u8])]) -> Result<(), String> {
+        let backups = files
+            .iter()
+            .map(|(name, _)| match fs::read(dir.join(name)) {
+                Ok(bytes) => Ok(Some(bytes)),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(error) => Err(format!("backing up {name}: {error}")),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        for (index, (name, bytes)) in files.iter().enumerate() {
+            if let Err(error) = write_file(&dir.join(name), bytes) {
+                let mut error = format!("replacing {name}: {error}");
+                for ((previous, _), backup) in files[..index].iter().zip(&backups).rev() {
+                    let path = dir.join(previous);
+                    let restore = match backup {
+                        Some(bytes) => write_file(&path, bytes),
+                        None => fs::remove_file(&path),
+                    };
+                    if let Err(restore) = restore {
+                        error.push_str(&format!(". Could not restore {previous}: {restore}"));
+                    }
+                }
+                return Err(error);
+            }
         }
-        run_logged(log_to, &mut command)
+        Ok(())
+    }
+
+    fn audio(log_to: &Log, start: bool) -> Result<(), String> {
+        log(
+            log_to,
+            if start {
+                "Starting Windows Audio"
+            } else {
+                "Stopping Windows Audio"
+            },
+        );
+        crate::windows_setup_paths::audio_services(start).map_err(|error| error.to_string())
     }
 
     /// Hush was previously called SteelMixer. If that version is installed,
@@ -354,24 +371,67 @@ mod install {
             log_to,
             "Found SteelMixer (the previous name of Hush): moving your settings",
         );
-        let copy_if_missing = |from: PathBuf, to: PathBuf| {
-            if from.exists() && !to.exists() {
-                if let Some(parent) = to.parent() {
-                    let _ = fs::create_dir_all(parent);
-                }
-                let _ = fs::copy(&from, &to);
+        let copy_if_missing = |from: PathBuf, to: PathBuf| -> std::io::Result<()> {
+            use std::{
+                io::Read,
+                os::windows::fs::{MetadataExt, OpenOptionsExt},
+            };
+            let Some(from_dir) = from.parent() else {
+                return Ok(());
+            };
+            let Some(to_dir) = to.parent() else {
+                return Ok(());
+            };
+            let _from = crate::windows_setup_paths::pin_directory(from_dir)?;
+            fs::create_dir_all(to_dir)?;
+            let _to = crate::windows_setup_paths::pin_directory(to_dir)?;
+            crate::windows_setup_paths::ensure_protected(to_dir, false)?;
+            let file = fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(0x0020_0000)
+                .open(from)?;
+            let metadata = file.metadata()?;
+            if !metadata.is_file() || metadata.file_attributes() & 0x400 != 0 {
+                return Err(std::io::Error::other("Legacy tuning is not a regular file"));
+            }
+            let mut text = String::new();
+            file.take(65_537).read_to_string(&mut text)?;
+            if text.len() > 65_536 {
+                return Err(std::io::Error::other("Legacy tuning is too large"));
+            }
+            match fs::OpenOptions::new().create_new(true).write(true).open(to) {
+                Ok(mut file) => file.write_all(text.as_bytes()),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+                Err(error) => Err(error),
             }
         };
-        let data = data_dir();
-        copy_if_missing(
-            data.join(r"SteelMixer\mic.conf"),
-            data.join(r"Hush\mic.conf"),
-        );
-        if let Some(appdata) = std::env::var_os("APPDATA").map(PathBuf::from) {
-            copy_if_missing(
-                appdata.join(r"SteelMixer\app.conf"),
-                appdata.join(r"Hush\app.conf"),
-            );
+        let Ok(data) = data_dir() else {
+            return;
+        };
+        if crate::windows_setup_paths::ensure_plain_dir(&old_dir).is_err()
+            || crate::windows_setup_paths::ensure_protected(&old_dir, true).is_err()
+            || crate::windows_setup_paths::ensure_protected(&old_setup, true).is_err()
+        {
+            return;
+        }
+        for name in ["SteelMixer", "Hush"] {
+            let candidate = data.join(name);
+            if candidate.exists()
+                && (crate::windows_setup_paths::ensure_plain_dir(&candidate).is_err()
+                    || crate::windows_setup_paths::ensure_protected(&candidate, false).is_err())
+            {
+                return;
+            }
+        }
+        let legacy_tuning = data.join(r"SteelMixer\mic.conf");
+        if legacy_tuning.exists() {
+            if let Err(error) = copy_if_missing(legacy_tuning, data.join(r"Hush\mic.conf")) {
+                log(
+                    log_to,
+                    format!("Could not migrate SteelMixer tuning: {error}"),
+                );
+                return;
+            }
         }
         log(log_to, "Removing SteelMixer");
         // The old app holds files in its folder open; close it first.
@@ -397,9 +457,6 @@ mod install {
         // sure nothing is left behind either way.
         std::thread::sleep(std::time::Duration::from_secs(3));
         let _ = fs::remove_dir_all(&old_dir);
-        if let Some(appdata) = std::env::var_os("APPDATA").map(PathBuf::from) {
-            let _ = fs::remove_dir_all(appdata.join("SteelMixer"));
-        }
     }
 
     /// Installs Hush. `Ok(Some(warning))` means Hush itself is installed
@@ -411,33 +468,35 @@ mod install {
         let app_exe = APP_EXE.unpack()?;
         let setup_exe = SETUP_EXE.unpack()?;
         let apo_dll = APO_DLL.unpack()?;
+        let guard = crate::windows_setup_paths::setup_lock()
+            .map_err(|e| format!("Another Hush setup or repair is running: {e}"))?;
         log(&log_to, "Closing Hush if it is running");
-        let _ = system_tool("taskkill.exe").and_then(|mut command| {
-            command
-                .args(["/im", "hush.exe", "/f"])
-                .creation_flags(NO_WINDOW)
-                .output()
-        });
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        if dir.exists() {
+            crate::windows_setup_paths::ensure_plain_dir(&dir).map_err(|e| e.to_string())?;
+            crate::windows_setup_paths::ensure_protected(&dir, true).map_err(|e| e.to_string())?;
+            crate::windows_setup_paths::stop_installed_app(&dir.join("hush.exe"))
+                .map_err(|e| e.to_string())?;
+        }
 
         migrate_from_steelmixer(&log_to);
 
         log(&log_to, format!("Copying files to {}", dir.display()));
         fs::create_dir_all(&dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
-        write_file(&dir.join("hush.exe"), &app_exe).map_err(|e| format!("hush.exe: {e}"))?;
-        write_file(&dir.join("hush-setup.exe"), &setup_exe)
-            .map_err(|e| format!("hush-setup.exe: {e}"))?;
-        // Both executables are available now. Register recovery before
-        // installing the other files or touching audio endpoints.
+        crate::windows_setup_paths::ensure_plain_dir(&dir).map_err(|e| e.to_string())?;
+        crate::windows_setup_paths::ensure_protected(&dir, true).map_err(|e| e.to_string())?;
+        replace_program_files(
+            &dir,
+            &[
+                ("hush.exe", &app_exe),
+                ("hush-setup.exe", &setup_exe),
+                ("LICENSE.txt", LICENSE.as_bytes()),
+                ("THIRD-PARTY-NOTICES.txt", NOTICES.as_bytes()),
+            ],
+        )?;
         log(&log_to, "Registering in Installed apps");
         register_uninstall(&dir)?;
-        for (name, text) in [
-            ("LICENSE.txt", LICENSE),
-            ("THIRD-PARTY-NOTICES.txt", NOTICES),
-        ] {
-            write_file(&dir.join(name), text.as_bytes()).map_err(|e| format!("{name}: {e}"))?;
-        }
 
+        drop(guard);
         // The plugin DLL may be loaded by Windows audio (upgrade): stage it
         // and let the setup tool swap it in while audio is stopped.
         let attached = match &options.microphone {
@@ -451,15 +510,12 @@ mod install {
                         .map_err(|e| e.to_string())?;
                     write_file(&staging.join("hush_apo.dll"), &apo_dll)
                         .map_err(|e| e.to_string())?;
-                    run_logged(
-                        &log_to,
-                        Command::new(staging.join("hush-setup.exe")).args([
-                            "install",
-                            "--mic",
-                            mic,
-                            "--replace-mic",
-                        ]),
-                    )
+                    let mut setup = Command::new(staging.join("hush-setup.exe"));
+                    setup.args(["install", "--mic", mic, "--replace-mic"]);
+                    if let Some(desk) = options.desk_mic {
+                        setup.args(["--desk-mic", if desk { "on" } else { "off" }]);
+                    }
+                    run_logged(&log_to, &mut setup)
                 })();
                 let _ = fs::remove_dir_all(&staging);
                 result.map_err(|e| format!("Clean Mic setup could not finish: {e}"))
@@ -469,6 +525,8 @@ mod install {
         // Without a successful attach the DLL is not in place yet; the app's
         // Clean Mic switch installs it from the program folder later.
         if attached.is_err() || options.microphone.is_none() {
+            let _guard = crate::windows_setup_paths::setup_lock()
+                .map_err(|e| format!("Another Hush setup or repair is running: {e}"))?;
             let target = dir.join("hush_apo.dll");
             if write_file(&target, &apo_dll).is_err() {
                 let written = audio(&log_to, false).and_then(|()| {
@@ -484,15 +542,7 @@ mod install {
                 }
             }
         }
-        let mut warning = attached.err();
-        if let Some(desk_mic) = options
-            .desk_mic
-            .filter(|_| warning.is_none() && options.microphone.is_some())
-        {
-            warning = save_mic_position(desk_mic).err().map(|error| {
-                format!("Could not save mic position: {error}. Set it in Hush under Microphone.")
-            });
-        }
+        let warning = attached.err();
         if let Some(warning) = &warning {
             log(&log_to, warning.clone());
         }
@@ -513,7 +563,9 @@ mod install {
         }
 
         log(&log_to, "Adding Start menu shortcut");
-        let shortcut = data_dir().join(r"Microsoft\Windows\Start Menu\Programs\Hush.lnk");
+        let shortcut = data_dir()
+            .map_err(|e| e.to_string())?
+            .join(r"Microsoft\Windows\Start Menu\Programs\Hush.lnk");
         let script = "$ErrorActionPreference = 'Stop'; $s = (New-Object -ComObject WScript.Shell).CreateShortcut($env:HUSH_SETUP_SHORTCUT); $s.TargetPath = $env:HUSH_SETUP_TARGET; $s.WorkingDirectory = $env:HUSH_SETUP_DIR; $s.IconLocation = $env:HUSH_SETUP_TARGET + ',0'; $s.Description = 'Hush'; $s.Save()";
         run_logged(
             &log_to,
@@ -526,21 +578,11 @@ mod install {
         )
         .map_err(|e| format!("creating shortcut: {e}"))?;
 
-        let (run, _) = RegKey::predef(HKEY_CURRENT_USER)
-            .create_subkey(r"Software\Microsoft\Windows\CurrentVersion\Run")
-            .map_err(|e| e.to_string())?;
-        if options.start_with_windows {
-            log(&log_to, "Starting Hush with Windows");
-            run.set_value(
-                "Hush",
-                &format!("\"{}\" --minimized", dir.join("hush.exe").display()),
-            )
-            .map_err(|e| e.to_string())?;
-        } else if let Err(error) = run.delete_value("Hush") {
-            if error.kind() != std::io::ErrorKind::NotFound {
-                return Err(format!("Removing the start-with-Windows entry: {error}"));
-            }
-        }
+        crate::machine_state::write(
+            "StartOnFirstLaunch",
+            if options.start_with_windows { "1" } else { "0" },
+        )
+        .map_err(|error| format!("saving the startup preference: {error}"))?;
         log(&log_to, "Done");
         Ok(warning)
     }
@@ -551,7 +593,7 @@ mod install {
     /// launched. Needs elevation (the manifest asks for it). Returns the
     /// process exit code: 0 when Hush is installed (a microphone setup
     /// warning still counts), 1 on failure. A log is written to
-    /// `%TEMP%\Hush-Setup.log`.
+    /// `%ProgramFiles%\Hush\install.log` when the program folder is available.
     pub fn run_silent() -> i32 {
         let options = Options {
             microphone: microphones().into_iter().next().map(|mic| mic.id),
@@ -562,13 +604,21 @@ mod install {
         let outcome = run(options, log_to.clone());
         let mut text = log_to.lock().unwrap().join("\r\n");
         let code = match &outcome {
-            Ok(_) => 0,
+            Ok(None) => 0,
+            Ok(Some(warning)) => {
+                text.push_str(&format!("\r\nWARNING: {warning}"));
+                1
+            }
             Err(error) => {
                 text.push_str(&format!("\r\nFAILED: {error}"));
                 1
             }
         };
-        let _ = fs::write(std::env::temp_dir().join("Hush-Setup.log"), text);
+        if let Ok(dir) = program_dir() {
+            if crate::windows_setup_paths::ensure_protected(&dir, true).is_ok() {
+                let _ = write_file(&dir.join("install.log"), text.as_bytes());
+            }
+        }
         code
     }
 

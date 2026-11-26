@@ -26,16 +26,16 @@ use windows::{
         },
         System::{
             Com::{
-                CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL,
-                COINIT_MULTITHREADED,
+                CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL, COINIT_MULTITHREADED,
             },
             Threading::GetCurrentThreadId,
         },
         UI::{
-            Input::KeyboardAndMouse::{RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_NOREPEAT},
+            Input::KeyboardAndMouse::{
+                RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_NOREPEAT,
+            },
             WindowsAndMessaging::{
-                GetMessageW, PeekMessageW, PostThreadMessageW, MSG, PM_NOREMOVE, WM_HOTKEY,
-                WM_QUIT,
+                GetMessageW, PeekMessageW, PostThreadMessageW, MSG, PM_NOREMOVE, WM_HOTKEY, WM_QUIT,
             },
         },
     },
@@ -160,27 +160,23 @@ struct Endpoint {
 }
 
 impl Endpoint {
-    /// Finds the plugged-in microphone with this friendly name. There is no
+    /// Opens the selected endpoint by ID. There is no
     /// fallback to another device: muting the wrong microphone is worse than
     /// reporting that the right one is missing.
     fn open(
         enumerator: &IMMDeviceEnumerator,
-        name: &str,
+        id: &str,
         shared: &Arc<Shared>,
     ) -> Result<Self, String> {
         let failed = |e: windows::core::Error| e.message();
-        let device = endpoints::find_active(name)
-            .into_iter()
-            .find_map(|endpoint| {
-                let full: Vec<u16> = endpoints::full_device_id(&endpoint.id)
-                    .encode_utf16()
-                    .chain(std::iter::once(0))
-                    .collect();
-                unsafe { enumerator.GetDevice(PCWSTR(full.as_ptr())) }.ok()
-            })
-            .ok_or_else(|| NOT_FOUND.to_string())?;
-        let volume = unsafe { device.Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None) }
-            .map_err(failed)?;
+        let full = windows_core::HSTRING::from(endpoints::full_device_id(id));
+        let device = unsafe { enumerator.GetDevice(PCWSTR(full.as_ptr())) }
+            .map_err(|_| NOT_FOUND.to_string())?;
+        if !unsafe { device.GetState() }.is_ok_and(|state| state.0 == 1) {
+            return Err(NOT_FOUND.to_string());
+        }
+        let volume =
+            unsafe { device.Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None) }.map_err(failed)?;
         let callback: IAudioEndpointVolumeCallback = VolumeEvents {
             shared: shared.clone(),
         }
@@ -226,7 +222,13 @@ impl Worker {
             .enumerator
             .as_ref()
             .ok_or_else(|| "Windows audio is not available.".to_string())?;
-        self.current = Some(Endpoint::open(enumerator, &self.device, &self.shared)?);
+        self.current = match Endpoint::open(enumerator, &self.device, &self.shared) {
+            Ok(endpoint) => Some(endpoint),
+            Err(error) => {
+                self.enumerator = None;
+                return Err(error);
+            }
+        };
         Ok(())
     }
 
@@ -334,6 +336,7 @@ impl Hotkey {
     /// press. Fails when another app already owns the key.
     pub fn register(key: MuteKey, on_press: impl Fn() + Send + 'static) -> Result<Self, String> {
         let (ready_tx, ready_rx) = mpsc::channel::<Result<u32, String>>();
+        let (go_tx, go_rx) = mpsc::channel();
         let thread = std::thread::Builder::new()
             .name("hush-hotkey".into())
             .spawn(move || {
@@ -356,7 +359,14 @@ impl Hotkey {
                 unsafe {
                     let _ = PeekMessageW(&mut msg, None, 0, 0, PM_NOREMOVE);
                 }
-                let _ = ready_tx.send(Ok(unsafe { GetCurrentThreadId() }));
+                if ready_tx.send(Ok(unsafe { GetCurrentThreadId() })).is_err()
+                    || go_rx.recv().is_err()
+                {
+                    unsafe {
+                        let _ = UnregisterHotKey(None, id);
+                    }
+                    return;
+                }
                 loop {
                     let got = unsafe { GetMessageW(&mut msg, None, 0, 0) };
                     if got.0 <= 0 || msg.message == WM_QUIT {
@@ -372,14 +382,17 @@ impl Hotkey {
             })
             .map_err(|e| e.to_string())?;
         match ready_rx.recv_timeout(Duration::from_secs(5)) {
-            Ok(Ok(thread_id)) => Ok(Self {
-                thread_id,
-                thread: Some(thread),
-            }),
-            Ok(Err(_)) | Err(_) => {
-                let _ = thread.join();
-                Err("That key is in use by another app.".into())
+            Ok(Ok(thread_id)) => {
+                go_tx
+                    .send(())
+                    .map_err(|_| "Hotkey worker stopped.".to_string())?;
+                Ok(Self {
+                    thread_id,
+                    thread: Some(thread),
+                })
             }
+            Ok(Err(error)) => Err(error),
+            Err(_) => Err("Hotkey registration did not finish.".into()),
         }
     }
 }

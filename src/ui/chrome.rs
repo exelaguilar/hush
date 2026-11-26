@@ -46,7 +46,7 @@ impl HushApp {
             } else {
                 p.muted_foreground
             });
-            let button = egui::Button::new(text)
+            let button = egui::Button::selectable(selected, text)
                 .fill(if selected {
                     p.muted
                 } else {
@@ -69,9 +69,20 @@ impl HushApp {
             if page == Page::Microphone && attention {
                 // The microphone needs attention: a dot leads there.
                 let r = response.rect;
-                ui.painter()
-                    .circle_filled(egui::pos2(r.right() - 14.0, r.center().y), 4.0, p.warning);
+                ui.painter().circle_filled(
+                    egui::pos2(r.right() - 14.0, r.center().y),
+                    4.0,
+                    p.warning,
+                );
                 response = response.on_hover_text(self.health.current().short());
+                response.widget_info(|| {
+                    egui::WidgetInfo::selected(
+                        egui::Role::Button,
+                        true,
+                        selected,
+                        format!("Microphone, {}", self.health.current().short()),
+                    )
+                });
             }
             if response.clicked() {
                 self.page = page;
@@ -89,51 +100,48 @@ impl HushApp {
     }
 
     pub(in crate::ui) fn header(&mut self, ui: &mut egui::Ui) {
+        let p = palette(ui);
         ui.add_space(10.0);
         ui.horizontal(|ui| {
             let (color, text) = self.status();
             ui.label(theme::semibold_text("Clean Mic").size(16.0));
-            match (text, self.apps_label()) {
-                ("Active", Some(apps)) => {
-                    theme::badge(ui, color, &format!("Active · {apps}"));
+            // "Active · Apex Legends, Discord": the apps that get the cleaned mic.
+            match self.apps_label().filter(|_| text == "Active") {
+                Some(apps) => {
+                    theme::badge(ui, color, &format!("Active · {apps}"))
+                        .on_hover_text(self.health.agent.apps.join(", "));
                 }
-                _ => {
+                None => {
                     theme::badge(ui, color, text);
                 }
             }
-            let talking = self
-                .live_levels
-                .is_some_and(|l| l.voice && l.age_ms() < 1500 && self.settings.enabled);
-            if talking {
-                theme::badge(ui, palette(ui).primary, "Talking");
-            }
-            if self.mute.is_muted() {
-                theme::badge(ui, palette(ui).destructive, "Muted");
-            }
-            match self.health.current() {
-                health::Health::Disconnected => {
-                    theme::badge(ui, palette(ui).warning, "Disconnected");
-                }
-                health::Health::EnhancementsOff => {
-                    theme::badge(ui, palette(ui).warning, "Enhancements off");
-                }
-                health::Health::Missing
-                | health::Health::NotProcessing
-                | health::Health::Bypassed
-                | health::Health::Failing => {
-                    theme::badge(ui, palette(ui).warning, "Not processing");
-                }
-                _ => {}
-            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if theme::switch(ui, &mut self.settings.enabled, "Clean Mic")
-                    .on_hover_text("Turn all microphone processing on or off")
+                    .on_hover_text("Turn microphone processing on or off")
                     .changed()
                 {
                     self.mark_dirty();
                 }
             });
         });
+        let talking = self
+            .live_levels
+            .is_some_and(|levels| levels.voice && levels.age_ms() < 1500 && self.settings.enabled);
+        let muted = self.mute.is_muted();
+        let health = self.health.current();
+        if talking || muted || health.needs_attention() {
+            ui.horizontal_wrapped(|ui| {
+                if talking {
+                    theme::badge(ui, p.primary, "Talking");
+                }
+                if muted {
+                    theme::badge(ui, p.destructive, "Muted");
+                }
+                if health.needs_attention() {
+                    theme::badge(ui, p.warning, health.short());
+                }
+            });
+        }
         ui.add_space(6.0);
     }
 
@@ -191,29 +199,41 @@ impl HushApp {
     /// "Hold to hear original" button. Returns while pressed.
     pub(in crate::ui) fn compare_button(&mut self, ui: &mut egui::Ui) {
         let p = palette(ui);
-        let label = if self.comparing {
+        let label = if self.compare.is_some() {
             theme::semibold_text("Hearing original…").color(p.primary_foreground)
         } else {
             RichText::new("Hold to hear original")
         };
         let response = ui.add(
             egui::Button::new(label)
-                .fill(if self.comparing {
+                .fill(if self.compare.is_some() {
                     p.primary
                 } else {
                     p.background
                 })
                 .stroke(egui::Stroke::new(
                     1.0,
-                    if self.comparing { p.primary } else { p.border },
+                    if self.compare.is_some() {
+                        p.primary
+                    } else {
+                        p.border
+                    },
                 ))
                 .corner_radius(6)
                 .sense(egui::Sense::click_and_drag()),
         );
-        let held = response.is_pointer_button_down_on();
-        if held != self.comparing {
-            self.comparing = held;
-            self.save_now();
+        let held = response.is_pointer_button_down_on()
+            || (response.has_focus()
+                && ui.input(|input| {
+                    input.key_down(egui::Key::Space) || input.key_down(egui::Key::Enter)
+                }));
+        match (held, self.compare.is_some()) {
+            (true, false) => match hush_apo::settings::CompareLease::begin() {
+                Ok(lease) => self.compare = Some((lease, std::time::Instant::now(), self.page)),
+                Err(error) => self.save_error = Some(format!("Could not compare: {error}")),
+            },
+            (false, true) => self.compare = None,
+            _ => {}
         }
     }
 

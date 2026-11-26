@@ -11,6 +11,7 @@
 #![allow(linker_messages)]
 
 pub mod denoise;
+#[cfg(any(test, feature = "offline-experiments"))]
 mod dereverb;
 pub mod dsp;
 mod protection;

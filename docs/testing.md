@@ -1,7 +1,7 @@
 # How Hush was tested
 
 Hush's sound was tuned by ear in level-matched A/B comparisons and backed
-by offline measurements. Its code has 99 automated tests, and its failure
+by offline measurements. Its code has automated regression tests, and its failure
 paths were tested by deliberately breaking them. It runs daily on real PCs
 in Discord calls and games.
 
@@ -58,14 +58,16 @@ Measurements guide the work, but the final decision is always made by ear.
 
 ## Automated tests
 
-`cargo test --workspace --exclude hush-installer --all-targets` runs 99
-tests. CI runs them on every push on a GitHub-hosted Windows machine.
+CI runs `cargo test --workspace --exclude hush-installer --all-targets`
+on a GitHub-hosted Windows machine. The release gate also compares synthetic
+PCM from the candidate and the 1.2.0 APO on the same machine using
+`tools/check-pcm.ps1`.
 
 | Area | Tests | Examples |
 | --- | --- | --- |
-| Audio plugin | 48 | Noise and click removal; a single click never opens the gate; soft word endings keep it open; limiter never exceeds its ceiling; other sample rates; real-time worker pacing; stream start without a fast-forward; watchdog and panic fallback; settings that survive garbage and read failures |
+| Audio plugin | 50 | Noise and click removal; a single click never opens the gate; soft word endings keep it open; limiter never exceeds its ceiling; other sample rates; real-time worker pacing; stream start without a fast-forward; watchdog and panic fallback; settings that survive garbage and read failures; concurrent settings edits wait instead of failing |
 | COM integration | 3 | Recreates how Windows' audio engine creates and aggregates the plugin |
-| App | 39 | Health watch decisions and rate limits; agent state file; window position; app display names; level warnings; diagnostics; settings import validation; version comparison; notification XML |
+| App | 45 | Health watch decisions and rate limits; agent state file; window position; app display names; level warnings; diagnostics; settings import validation; version comparison; notification XML; setup lock and named events wait out a previous holder |
 | Setup tool | 9 | Repair planning: an unplugged mic, a mic back under a new ID, two mics with the same name; install record and repair task XML |
 
 ## Failure testing

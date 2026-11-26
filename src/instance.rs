@@ -58,7 +58,10 @@ pub fn acquire(mutex_name: &str, show_event: &str) -> Option<Instance> {
         if GetLastError() == ERROR_ALREADY_EXISTS {
             // Let the running instance bring its window to the foreground.
             let _ = AllowSetForegroundWindow(ASFW_ANY);
-            crate::ipc::signal(show_event);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while !crate::ipc::signal(show_event) && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
             let _ = CloseHandle(mutex);
             return None;
         }

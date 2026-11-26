@@ -9,21 +9,21 @@
 | `hush-setup.exe` (`src/bin/hush-setup.rs`) | Installs and removes the plugin on a microphone, reports status. |
 | `Hush-Setup-<version>.exe` (`installer/`) | Wizard that embeds the three files above. Built by `package.ps1`. |
 
-The app and plugin share `%ProgramData%\Hush`:
+The app and plugin share settings under `%ProgramData%\Hush` and engine status under `%ProgramData%\HushRuntime`:
 
 - `mic.conf` holds the settings, written by the app and polled by the plugin
   every 250 ms. Unknown keys are ignored and missing keys use defaults, so
   older and newer settings files load safely.
-- `status.txt` is a heartbeat the plugin writes once a second while audio
+- In the runtime directory, `status.txt` is a heartbeat the plugin writes once a second while audio
   flows (every 30 s otherwise). It includes `cpu_permille`, Clean Mic's own
-  CPU use over the last second in tenths of a percent of one core: the
+  estimated load over the last second in tenths of a percent of one core: the
   denoiser thread's CPU time (`GetThreadTimes`, read by the thread itself
   twice a second) plus the time spent in the audio callback. The plugin's
   helper thread wakes 20 times a second while audio flows and 4 times a
   second after 2 s without audio.
 - `live.bin` is a memory-mapped file the plugin updates 20 times a second
   with meter levels.
-- `installed.txt` records every registry value `hush-setup` wrote.
+- `HKLM\SOFTWARE\Exel\Hush` holds the protected endpoint record and last repair result.
 
 ## Two processes
 
@@ -85,9 +85,11 @@ least once a second.
   net, so a steady state costs one session enumeration per microphone. `Monitor` is the pure decision logic: input
   snapshot and time in, health state, repair action and notification out.
   Automatic repairs are limited to one per 2 minutes and 3 per 30 minutes,
-  and never run while "Hold to hear original" is pressed.
+  and never start while "Hold to hear original" is pressed. A short lease
+  tied to the window process expires automatically if the window stops responding.
   Health states: Disconnected, Missing (reconnected without Hush attached),
-  Not processing (an app records but `live.bin` is stale for more than 4 s),
+  Not processing (an app records but `live.bin` is stale). Automatic restart
+  requires four continuous seconds of stale capture, with a new grace period after resume.
   Bypassed (still not processing 15 s after a restart), Failing, Enhancements
   off, and an informational "app uses another microphone" hint.
   Enhancements off means Windows' "Audio enhancements" switch
@@ -113,11 +115,14 @@ least once a second.
 ## Repair tasks
 
 `hush-setup.exe` creates two on-demand scheduled tasks that run as SYSTEM:
-`\Hush\Repair Clean Mic` (`repair --quiet`) and `\Hush\Restart Clean Mic`
-(`repair --restart-audio --quiet`). A standard user may start them. The app
-runs exactly `schtasks.exe /run /tn <task>` and waits for a newer
-`time_unix` in `%ProgramData%\Hush\repair.txt`. The commands are fixed and
-only run on demand. If the task is missing, the app falls back once to the
+`\Hush\Repair Clean Mic` (`repair --quiet --scheduled`) and `\Hush\Restart Clean Mic`
+(`repair --restart-audio --quiet --scheduled`). A standard user may start them. The app
+runs the local `schtasks.exe /run /tn <task>` and waits for a newer generation
+for that operation in the protected registry report. The commands are fixed
+and run on demand. A machine lock serializes privileged mutations; each run
+waits up to 45 s for it, and a repair that still cannot take it records an
+error result, so the app gets an answer instead of timing out. If an
+on-demand task is unavailable, the app falls back to the
 normal elevated `hush-setup.exe repair` (a UAC prompt), and only when the
 user clicked **Fix now**. Automatic repairs never show a UAC prompt.
 
@@ -180,13 +185,14 @@ limiter delays, so it can differ from the reported estimate.
 - adds the CLSID and processing mode to the microphone's `FxProperties`
   endpoint-effect (EFX) slot, but only if those values are empty. Another
   product's effect is never replaced;
-- creates `%ProgramData%\Hush`, granting write access to Users, the audio
-  service and the write-restricted token `audiodg.exe` runs with;
+- creates `%ProgramData%\Hush` for user tuning, with read access for the
+  audio engine, and `%ProgramData%\HushRuntime` for engine output, with
+  read-only user access and write access for the restricted audio service;
 - restarts Windows Audio and Audio Endpoint Builder, which caches effect
   settings.
 
 `uninstall` identifies Hush-owned slots by their live CLSID and removes the
-matching mode value with the slot. `installed.txt` is a status record. When
+matching mode value with the slot. Setup stores its repair intent in HKLM. When
 Setup switches microphones, it attaches by endpoint ID and rolls back
 endpoint writes if switching or saving the record fails. The installer
 registers the *Installed apps* entry before

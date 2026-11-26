@@ -28,6 +28,7 @@ fn main() {
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| manifest_dir.join("..").join("target").join("release"));
     let payload = payload.canonicalize().unwrap_or(payload);
+    println!("cargo:rustc-env=HUSH_PAYLOAD_DIR={}", payload.display());
     let out_dir = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap());
     for file in FILES {
         let path = payload.join(file);

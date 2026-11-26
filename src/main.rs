@@ -76,10 +76,28 @@ fn uninstall() {
         .ok()
         .and_then(|exe| exe.parent().map(|d| d.to_path_buf()))
     {
-        let _ = std::process::Command::new(dir.join("hush-setup.exe"))
-            .arg("uninstall-app")
+        let result = std::process::Command::new(dir.join("hush-setup.exe"))
+            .args(["uninstall-app", "--from-app", "--quiet"])
             .creation_flags(CREATE_NO_WINDOW)
-            .spawn();
+            .status();
+        let message = if result.is_ok_and(|code| code.success()) {
+            ipc::signal(ipc::EV_QUIT);
+            ipc::signal(ipc::EV_WINDOW_CLOSE);
+            prefs::cleanup_install();
+            windows_core::w!(
+                "Hush was removed. Windows may finish removing in-use files after a restart."
+            )
+        } else {
+            windows_core::w!("Windows did not finish uninstalling Hush.")
+        };
+        unsafe {
+            MessageBoxW(
+                None,
+                message,
+                windows_core::w!("Uninstall Hush"),
+                windows::Win32::UI::WindowsAndMessaging::MB_OK,
+            );
+        }
     }
 }
 
@@ -87,11 +105,13 @@ fn uninstall() {
 fn main() -> eframe::Result {
     // Windows "Installed apps" > Uninstall runs `hush.exe --uninstall`:
     // confirm in a normal dialog, then remove everything without a console.
-    if std::env::args().any(|arg| arg == "--uninstall") {
+    if std::env::args_os().any(|arg| arg == "--uninstall") {
         uninstall();
         return Ok(());
     }
-    let args: Vec<String> = std::env::args().collect();
+    let args: Vec<String> = std::env::args_os()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
     let page = args
         .iter()
         .position(|arg| arg == ipc::PAGE_FLAG)
@@ -119,6 +139,7 @@ fn main() -> eframe::Result {
         .iter()
         .any(|arg| arg == notify::SHOW_FLAG || arg.starts_with("hush:"));
     let start_hidden = !show && args.iter().any(|arg| arg == prefs::MINIMIZED_FLAG);
+    prefs::initialize_startup();
     agent::run(!start_hidden, page);
     Ok(())
 }

@@ -11,12 +11,14 @@ Set-Location $PSScriptRoot
 $env:CARGO_PROFILE_RELEASE_BUILD_OVERRIDE_OPT_LEVEL = '3'
 
 Write-Host 'Building Hush (release)...' -ForegroundColor Cyan
-cargo build --release --workspace --exclude hush-installer
+cargo build --locked --release -p hush --bin hush --bin hush-setup
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+cargo build --locked --release -p hush-apo
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 Write-Host 'Building installer...' -ForegroundColor Cyan
 $env:SM_PAYLOAD_DIR = Join-Path $PSScriptRoot 'target\release'
-cargo build --release -p hush-installer
+cargo build --locked --release -p hush-installer
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"' | Select-Object -First 1).Matches.Groups[1].Value

@@ -13,7 +13,7 @@ impl HushApp {
         theme::page_header(
             ui,
             "Mic Test",
-            "Hear exactly what others hear. Toggle settings while listening to compare.",
+            "Preview this microphone in Hush. Toggle settings while listening to compare.",
         );
         let p = palette(ui);
         if self.test_state.mic.is_none() {
@@ -21,9 +21,15 @@ impl HushApp {
                 theme::row(
                     ui,
                     "Microphone test",
-                    "Opens the microphone the same way Discord does.",
+                    "Opens the selected microphone in shared mode.",
                     |ui| {
-                        if theme::primary_button(ui, "Start test").clicked() {
+                        if ui
+                            .add_enabled(
+                                !self.selected_mic.is_empty(),
+                                egui::Button::new("Start test"),
+                            )
+                            .clicked()
+                        {
                             self.start_test();
                         }
                     },
@@ -47,42 +53,60 @@ impl HushApp {
             return;
         }
 
+        if let Some(error) = &self.test_state.error {
+            ui.label(RichText::new(error).small().color(p.destructive));
+        }
+        let running = self
+            .test_state
+            .mic
+            .as_ref()
+            .is_some_and(mic_test::MicTest::is_running);
+        if !running {
+            ui.label("Capture stopped. You can play or save the last take.");
+            if theme::primary_button(ui, "Start test").clicked() {
+                self.start_test();
+            }
+        }
         let level_db = 20.0 * self.test_state.meter.max(1e-5).log10();
         let fill = ((level_db + 60.0) / 60.0).clamp(0.0, 1.0);
-        theme::card(ui, Some("What others hear"), None, |ui| {
-            let (rect, _) = ui
-                .allocate_exact_size(egui::vec2(ui.available_width(), 10.0), egui::Sense::hover());
-            ui.painter().rect_filled(rect, 5.0, p.track);
-            let mut bar = rect;
-            bar.set_width(rect.width() * fill);
-            let color = if level_db > -3.0 {
-                p.destructive
-            } else if level_db > -12.0 {
-                p.warning
-            } else {
-                p.primary
-            };
-            ui.painter().rect_filled(bar, 5.0, color);
-            if level_db < -60.0 {
-                theme::hint(ui, "Silent");
-            } else {
-                theme::hint(ui, &format!("{level_db:.0} dB"));
-            }
-            theme::hint(
-                ui,
-                "Level after Clean Mic. Silence between words is normal.",
-            );
-        });
-        ui.add_space(12.0);
-        theme::card(ui, Some("Compare"), None, |ui| {
-            theme::row(
-                ui,
-                "Original vs. Clean Mic",
-                "With Hear myself on, hold the button to hear your raw microphone.",
-                |ui| self.compare_button(ui),
-            );
-        });
-        ui.add_space(12.0);
+        if running {
+            theme::card(ui, Some("Microphone preview"), None, |ui| {
+                let (rect, _) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), 10.0),
+                    egui::Sense::hover(),
+                );
+                ui.painter().rect_filled(rect, 5.0, p.track);
+                let mut bar = rect;
+                bar.set_width(rect.width() * fill);
+                let color = if level_db > -3.0 {
+                    p.destructive
+                } else if level_db > -12.0 {
+                    p.warning
+                } else {
+                    p.primary
+                };
+                ui.painter().rect_filled(bar, 5.0, color);
+                if level_db < -60.0 {
+                    theme::hint(ui, "Silent");
+                } else {
+                    theme::hint(ui, &format!("{level_db:.0} dB"));
+                }
+                theme::hint(
+                    ui,
+                    "Level after Clean Mic. Silence between words is normal.",
+                );
+            });
+            ui.add_space(12.0);
+            theme::card(ui, Some("Compare"), None, |ui| {
+                theme::row(
+                    ui,
+                    "Original vs. Clean Mic",
+                    "With Hear myself on, hold the button to hear your raw microphone.",
+                    |ui| self.compare_button(ui),
+                );
+            });
+            ui.add_space(12.0);
+        }
         let mut stop = false;
         let mut saved = None;
         if let Some(test) = &self.test_state.mic {
@@ -90,9 +114,14 @@ impl HushApp {
                 theme::row(
                     ui,
                     "Hear myself",
-                    &format!("Plays through {}. Use headphones.", test.output_name),
+                    "Plays through the Windows default output. Use headphones.",
                     |ui| {
-                        if theme::switch(ui, &mut self.test_state.monitor, "Hear myself").changed()
+                        if ui
+                            .add_enabled_ui(running, |ui| {
+                                theme::switch(ui, &mut self.test_state.monitor, "Hear myself")
+                            })
+                            .inner
+                            .changed()
                         {
                             if let Err(error) = test.set_monitor(self.test_state.monitor) {
                                 self.test_state.monitor = false;
@@ -135,7 +164,10 @@ impl HushApp {
                             if test.has_recording() && theme::outline_button(ui, "Save").clicked() {
                                 saved = Some(test.save_recording().map_err(|e| format!("{e:#}")));
                             }
-                            if theme::outline_button(ui, "Record").clicked() {
+                            if ui
+                                .add_enabled(running, egui::Button::new("Record"))
+                                .clicked()
+                            {
                                 test.start_recording();
                             }
                         }
@@ -144,7 +176,7 @@ impl HushApp {
             });
             ui.add_space(12.0);
             ui.horizontal(|ui| {
-                if theme::outline_button(ui, "Stop test").clicked() {
+                if running && theme::outline_button(ui, "Stop test").clicked() {
                     stop = true;
                 }
                 if theme::outline_button(ui, "Open recordings folder").clicked() {
@@ -153,7 +185,9 @@ impl HushApp {
             });
         }
         if stop {
-            self.test_state.mic = None;
+            if let Some(test) = &mut self.test_state.mic {
+                test.stop_input();
+            }
             self.test_state.monitor = false;
         }
         if let Some(result) = saved {

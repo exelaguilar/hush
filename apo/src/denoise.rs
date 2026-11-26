@@ -266,6 +266,7 @@ struct Model {
     atten_db: f32,
     input_gain: f32,
     cleaner: Option<crate::protection::ProtectionCleaner>,
+    #[cfg(any(test, feature = "offline-experiments"))]
     dereverb: Option<crate::dereverb::LateReverbFilter>,
 }
 
@@ -293,6 +294,7 @@ impl Model {
                         options.protection_cleaning.clamp(0.0, 1.0),
                     )
                 }),
+            #[cfg(any(test, feature = "offline-experiments"))]
             dereverb: (options.late_reverb_rt60.is_finite() && options.late_reverb_rt60 > 0.0)
                 .then(|| {
                     crate::dereverb::LateReverbFilter::new(
@@ -340,6 +342,7 @@ impl Model {
                 cleaner.process(noisy, output, self.atten_db, learn_noise && lsnr < 0.0);
             }
         }
+        #[cfg(any(test, feature = "offline-experiments"))]
         if let Some(dereverb) = &mut self.dereverb {
             dereverb.process(output, self.atten_db > OFF_DB);
         }
@@ -796,7 +799,10 @@ fn publish_worker_cpu() {
 /// Kernel plus user time of the calling thread.
 #[cfg(windows)]
 fn thread_cpu_ns() -> Option<u64> {
-    use windows::Win32::{Foundation::FILETIME, System::Threading::{GetCurrentThread, GetThreadTimes}};
+    use windows::Win32::{
+        Foundation::FILETIME,
+        System::Threading::{GetCurrentThread, GetThreadTimes},
+    };
     let (mut created, mut exited, mut kernel, mut user) = (
         FILETIME::default(),
         FILETIME::default(),
@@ -804,7 +810,14 @@ fn thread_cpu_ns() -> Option<u64> {
         FILETIME::default(),
     );
     unsafe {
-        GetThreadTimes(GetCurrentThread(), &mut created, &mut exited, &mut kernel, &mut user).ok()?;
+        GetThreadTimes(
+            GetCurrentThread(),
+            &mut created,
+            &mut exited,
+            &mut kernel,
+            &mut user,
+        )
+        .ok()?;
     }
     let ticks = |t: FILETIME| ((t.dwHighDateTime as u64) << 32) | t.dwLowDateTime as u64;
     // FILETIME counts 100 ns units.
@@ -855,6 +868,8 @@ pub struct ThreadedDenoiser {
     max_queued: usize,
     watchdog_limit: usize,
     underrun_samples: usize,
+    #[cfg(feature = "experimental-startup-watchdog")]
+    loading_remaining: usize,
     fallback: bool,
 }
 
@@ -897,6 +912,10 @@ impl ThreadedDenoiser {
                 let _priority = ProAudioPriority::enable();
                 let result = catch_unwind(AssertUnwindSafe(|| {
                     let mut engine = load(worker_shared.talking.clone());
+                    #[cfg(feature = "experimental-startup-watchdog")]
+                    if worker_shared.stop.load(Ordering::Acquire) {
+                        return Ok(());
+                    }
                     let mut input: Vec<f32> = Vec::with_capacity(ring_size);
                     let mut output: Vec<f32> = Vec::with_capacity(ring_size);
                     if engine.pipeline.model.is_none() || engine.passthrough {
@@ -978,6 +997,8 @@ impl ThreadedDenoiser {
             max_queued,
             watchdog_limit: samples_for_ms(native_rate, WATCHDOG_MS),
             underrun_samples: 0,
+            #[cfg(feature = "experimental-startup-watchdog")]
+            loading_remaining: samples_for_ms(native_rate, 2_000),
             fallback: false,
         }
     }
@@ -1034,6 +1055,14 @@ impl ThreadedDenoiser {
         }
         let state = self.shared.state.load(Ordering::Acquire);
         if state == LOADING {
+            #[cfg(feature = "experimental-startup-watchdog")]
+            {
+                self.loading_remaining = self.loading_remaining.saturating_sub(1);
+                if self.loading_remaining == 0 {
+                    self.latch_fallback();
+                    return input;
+                }
+            }
             return 0.0;
         }
         let queued = self.from_worker.slots();
@@ -1081,6 +1110,11 @@ impl ThreadedDenoiser {
 impl Drop for ThreadedDenoiser {
     fn drop(&mut self) {
         self.shared.stop.store(true, Ordering::Release);
+        #[cfg(feature = "experimental-startup-watchdog")]
+        if self.shared.state.load(Ordering::Acquire) == LOADING {
+            // The loading closure owns all of its state, and the APO DLL pins its lifetime.
+            return;
+        }
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }

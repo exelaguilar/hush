@@ -1889,7 +1889,7 @@ checksum = "62adaabb884c94955b19907d60019f4e145d091c75345379e70d1ee696f7854f"
 
 [[package]]
 name = "hush"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "anyhow",
  "cpal",
@@ -1906,7 +1906,7 @@ dependencies = [
 
 [[package]]
 name = "hush-apo"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "deep_filter",
  "memmap2 0.9.12",
@@ -1920,9 +1920,10 @@ dependencies = [
 
 [[package]]
 name = "hush-installer"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "brotli",
+ "brotli-decompressor",
  "eframe",
  "winreg",
  "winresource",

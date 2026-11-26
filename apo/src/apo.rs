@@ -28,8 +28,8 @@ use std::{
 };
 use windows::Win32::{
     Foundation::{
-        CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, E_NOINTERFACE, E_OUTOFMEMORY, E_POINTER,
-        S_FALSE, S_OK,
+        CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, E_FAIL, E_NOINTERFACE, E_OUTOFMEMORY,
+        E_POINTER, S_FALSE, S_OK,
     },
     Media::Audio::Apo::{
         IAudioMediaType, IAudioProcessingObject, IAudioProcessingObjectConfiguration,
@@ -317,10 +317,22 @@ impl Core {
         state.rate = input_format.fFramesPerSecond as u32;
         state.max_frames = input.u32MaxFrameCount.min(output.u32MaxFrameCount);
         // All allocation for the stream happens here, off the real-time thread.
-        state.input_backup = vec![0.0; state.max_frames as usize * state.channels];
+        let samples = (state.max_frames as usize)
+            .checked_mul(state.channels)
+            .ok_or(APOERR_INVALID_CONNECTION_FORMAT)?;
+        // A single engine buffer cannot legitimately represent more than one second.
+        if state.max_frames == 0 || state.max_frames > state.rate {
+            return Err(APOERR_INVALID_CONNECTION_FORMAT.into());
+        }
+        state
+            .input_backup
+            .try_reserve_exact(samples)
+            .map_err(|_| E_OUTOFMEMORY)?;
+        state.input_backup.resize(samples, 0.0);
         state.dsp = Some(Box::new(CleanMic::new(state.rate, state.channels)));
         state.settings = settings::current().unwrap_or_default();
         state.faulted = false;
+        settings::reset_stream_fault();
         state.locked = true;
         Ok(())
     }
@@ -753,7 +765,10 @@ unsafe extern "system" fn config_lock(
 ) -> HRESULT {
     unsafe {
         let core = &object::<OFF_CONFIG>(this).core;
-        let result = core.lock(input_count, inputs, output_count, outputs);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            core.lock(input_count, inputs, output_count, outputs)
+        }))
+        .unwrap_or_else(|_| Err(E_FAIL.into()));
         let state = core.state();
         settings::trace(&format!(
             "LockForProcess: {input_count} in / {output_count} out -> {} ({} ch, {} Hz, max {} frames)",

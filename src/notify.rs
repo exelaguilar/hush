@@ -11,8 +11,8 @@ use std::path::{Path, PathBuf};
 use windows::{
     core::HSTRING,
     Data::Xml::Dom::XmlDocument,
-    UI::Notifications::{ToastNotification, ToastNotificationManager},
     Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED},
+    UI::Notifications::{ToastNotification, ToastNotificationManager},
 };
 use winreg::{enums::HKEY_CURRENT_USER, RegKey};
 
@@ -22,8 +22,9 @@ const PROTOCOL_KEY: &str = r"Software\Classes\hush";
 pub const SHOW_FLAG: &str = "--show";
 
 /// Whether this exe runs from %ProgramFiles%\Hush (the installed copy).
-fn running_installed() -> bool {
-    let (Ok(exe), Some(program_files)) = (std::env::current_exe(), std::env::var_os("ProgramFiles"))
+pub fn running_installed() -> bool {
+    let (Ok(exe), Some(program_files)) =
+        (std::env::current_exe(), std::env::var_os("ProgramFiles"))
     else {
         return false;
     };

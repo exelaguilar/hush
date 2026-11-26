@@ -17,7 +17,7 @@ impl HushApp {
             theme::row(
                 ui,
                 "Start with Windows",
-                "Starts quietly in the system tray when you sign in.",
+                "Requests startup in the tray. You can also manage Hush in Windows Startup apps.",
                 |ui| {
                     if theme::switch(ui, &mut self.start_with_windows, "Start with Windows")
                         .changed()
@@ -99,7 +99,13 @@ impl HushApp {
                     }
                 });
             }
-            if let Some(error) = self.health.agent.hotkey_error.clone().filter(|_| self.prefs.mute_hotkey) {
+            if let Some(error) = self
+                .health
+                .agent
+                .hotkey_error
+                .clone()
+                .filter(|_| self.prefs.mute_hotkey)
+            {
                 ui.label(RichText::new(error).small().color(p.destructive));
             }
             theme::separator(ui);

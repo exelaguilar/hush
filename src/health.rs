@@ -16,7 +16,7 @@ use std::{
     collections::{hash_map::DefaultHasher, HashMap, VecDeque},
     hash::{Hash, Hasher},
     sync::mpsc,
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, Instant},
 };
 use windows::{
     core::{implement, Interface, HSTRING, PCWSTR},
@@ -60,6 +60,7 @@ pub struct Probe {
     /// "Audio enhancements" are switched off for the endpoint Hush is on, so
     /// Windows skips every plugin there.
     pub enhancements_off: bool,
+    pub effect_conflict: bool,
     /// An app is actively capturing from that endpoint.
     pub capturing_here: bool,
     /// Identifies the set of capturing sessions (to notice changes).
@@ -102,8 +103,13 @@ pub enum Health {
     Failing,
     /// "Audio enhancements" are off in Windows, which skips Clean Mic.
     EnhancementsOff,
+    EffectConflict,
+    Unavailable,
     /// Informational: an app uses another microphone.
-    WrongMic { app: String, other: String },
+    WrongMic {
+        app: String,
+        other: String,
+    },
 }
 
 impl Health {
@@ -121,6 +127,8 @@ impl Health {
             Health::Bypassed => "bypassed",
             Health::Failing => "failing",
             Health::EnhancementsOff => "enhancements_off",
+            Health::EffectConflict => "effect_conflict",
+            Health::Unavailable => "unavailable",
             Health::WrongMic { .. } => "wrong_mic",
         }
     }
@@ -134,6 +142,8 @@ impl Health {
             "bypassed" => Health::Bypassed,
             "failing" => Health::Failing,
             "enhancements_off" => Health::EnhancementsOff,
+            "effect_conflict" => Health::EffectConflict,
+            "unavailable" => Health::Unavailable,
             _ => return None,
         })
     }
@@ -147,6 +157,8 @@ impl Health {
                 "Clean Mic not processing"
             }
             Health::EnhancementsOff => "Enhancements off",
+            Health::EffectConflict => "Effect slot conflict",
+            Health::Unavailable => "Microphone status unavailable",
             Health::WrongMic { .. } => "Other microphone in use",
         }
     }
@@ -170,6 +182,8 @@ impl Health {
             Health::EnhancementsOff => {
                 format!("Audio enhancements are off for {mic}, so Windows skips Clean Mic.")
             }
+            Health::EffectConflict => format!("The effect settings for {mic} conflict with Clean Mic. Select another microphone or review its effects in Windows."),
+            Health::Unavailable => "Hush is reconnecting to Windows Audio.".into(),
             Health::WrongMic { app, other } => format!("{app} is using {other}, not {mic}."),
         }
     }
@@ -244,6 +258,7 @@ pub struct Monitor {
     last_attempt: Option<Instant>,
     busy: bool,
     restart_done_at: Option<Instant>,
+    stale_capture: Option<(u64, Instant, Instant)>,
     bypass_key: Option<u64>,
     bypass_notified: bool,
     failing_notified: bool,
@@ -254,6 +269,16 @@ pub struct Monitor {
 }
 
 impl Monitor {
+    pub fn reset_capture(&mut self) {
+        self.stale_capture = None;
+        self.restart_done_at = None;
+        self.bypass_key = None;
+        self.bypass_notified = false;
+        self.disconnected_since = None;
+        self.disconnected_notified = false;
+        self.wrong_since = None;
+    }
+
     /// A repair started by the user (Fix now) is running.
     pub fn manual_started(&mut self) {
         self.busy = true;
@@ -333,6 +358,17 @@ impl Monitor {
             notice: None,
         };
         let probe = &snap.probe;
+        let stale = snap.live_age_ms.is_none_or(|age| age > STALE_MS);
+        if !snap.installed
+            || !probe.attached_to_active
+            || !probe.capturing_here
+            || !stale
+            || !snap.clean_mic_on
+            || cfg.hold_pressed
+            || probe.enhancements_off
+        {
+            self.stale_capture = None;
+        }
         if !snap.installed || snap.mic.is_empty() {
             self.disconnected_since = None;
             self.wrong_since = None;
@@ -347,12 +383,18 @@ impl Monitor {
                 && now.saturating_duration_since(since) >= DISCONNECT_GRACE
             {
                 self.disconnected_notified = true;
-                step.notice = self.emit("disconnected", Notice::Disconnected(snap.mic.clone()), now);
+                step.notice =
+                    self.emit("disconnected", Notice::Disconnected(snap.mic.clone()), now);
             }
             return step;
         }
         self.disconnected_since = None;
         self.disconnected_notified = false;
+
+        if probe.effect_conflict {
+            step.health = Health::EffectConflict;
+            return step;
+        }
 
         // 2. Back, but Hush is not attached to it.
         if !probe.attached_to_active {
@@ -392,8 +434,7 @@ impl Monitor {
         {
             self.restart_done_at = None;
         }
-        let stale = snap.live_age_ms.is_none_or(|age| age > STALE_MS);
-        if probe.capturing_here && stale && snap.clean_mic_on {
+        if probe.capturing_here && stale && snap.clean_mic_on && !cfg.hold_pressed {
             if self.bypass_key == Some(probe.capture_key) {
                 step.health = Health::Bypassed;
                 return step;
@@ -405,7 +446,8 @@ impl Monitor {
                     step.health = Health::Bypassed;
                     if !self.bypass_notified {
                         self.bypass_notified = true;
-                        step.notice = self.emit("bypassed", Notice::Bypassed(snap.mic.clone()), now);
+                        step.notice =
+                            self.emit("bypassed", Notice::Bypassed(snap.mic.clone()), now);
                     }
                 } else {
                     step.health = Health::NotProcessing;
@@ -413,7 +455,18 @@ impl Monitor {
                 return step;
             }
             step.health = Health::NotProcessing;
-            self.act(ActionKind::Restart, &mut step, cfg, now);
+            let (key, since, last) =
+                self.stale_capture
+                    .get_or_insert((probe.capture_key, now, now));
+            if *key != probe.capture_key
+                || now.saturating_duration_since(*last) > Duration::from_secs(5)
+            {
+                (*key, *since) = (probe.capture_key, now);
+            }
+            *last = now;
+            if now.saturating_duration_since(*since) >= Duration::from_millis(STALE_MS) {
+                self.act(ActionKind::Restart, &mut step, cfg, now);
+            }
             return step;
         }
 
@@ -458,7 +511,6 @@ impl Monitor {
 #[derive(Default)]
 struct ProbeCache {
     endpoints: Vec<endpoints::Endpoint>,
-    recorded: Vec<(String, String)>,
     scanned: Option<Instant>,
     managers: HashMap<String, IAudioSessionManager2>,
     names: HashMap<u32, Option<String>>,
@@ -479,7 +531,6 @@ impl ProbeCache {
             return;
         }
         self.endpoints = endpoints::capture_endpoints();
-        self.recorded = install_state::recorded_endpoints();
         self.scanned = Some(Instant::now());
         let active: Vec<&str> = self
             .endpoints
@@ -502,7 +553,7 @@ impl ProbeCache {
     }
 
     /// Active capture sessions on one endpoint: process ids.
-    fn active_sessions(&mut self, enumerator: &IMMDeviceEnumerator, id: &str) -> Vec<u32> {
+    fn active_sessions(&mut self, enumerator: &IMMDeviceEnumerator, id: &str) -> Option<Vec<u32>> {
         let mut pids = Vec::new();
         if !self.managers.contains_key(id) {
             let full = HSTRING::from(endpoints::full_device_id(id));
@@ -515,18 +566,16 @@ impl ProbeCache {
                 Ok(manager) => {
                     self.managers.insert(id.to_string(), manager);
                 }
-                Err(_) => return pids,
+                Err(_) => return None,
             }
         }
-        let Some(manager) = self.managers.get(id) else {
-            return pids;
-        };
+        let manager = self.managers.get(id)?;
         unsafe {
             let Ok(sessions) = manager.GetSessionEnumerator() else {
                 self.managers.remove(id);
-                return pids;
+                return None;
             };
-            for index in 0..sessions.GetCount().unwrap_or(0) {
+            for index in 0..sessions.GetCount().ok()? {
                 let Ok(control) = sessions.GetSession(index) else {
                     continue;
                 };
@@ -538,35 +587,39 @@ impl ProbeCache {
                 }
             }
         }
-        pids
+        Some(pids)
     }
 }
 
-fn probe(enumerator: &IMMDeviceEnumerator, mic: &str, cache: &mut ProbeCache) -> Probe {
+fn probe(enumerator: &IMMDeviceEnumerator, target: &str, cache: &mut ProbeCache) -> Option<Probe> {
     let mut probe = Probe::default();
     cache.refresh();
     let all = cache.endpoints.clone();
-    probe.endpoint_active = cache.recorded.iter().any(|(flow, id)| {
-        flow == "Capture"
-            && all
-                .iter()
-                .any(|e| e.id == *id && e.active && endpoints::names_match(&e.name, mic))
-    });
+    let selected = all.iter().find(|e| e.id.eq_ignore_ascii_case(target));
     let active: Vec<&endpoints::Endpoint> = all.iter().filter(|e| e.active).collect();
-    let here: Vec<&&endpoints::Endpoint> = active
-        .iter()
-        .filter(|e| endpoints::names_match(&e.name, mic))
-        .collect();
-    probe.same_name_active = !here.is_empty();
-    probe.attached_to_active = here.iter().any(|e| e.has_hush);
-    probe.enhancements_off = here.iter().any(|e| e.has_hush && e.enhancements_off);
+    probe.endpoint_active = selected.is_some_and(|e| e.active);
+    probe.same_name_active = selected.is_some_and(|selected| {
+        active.iter().any(|e| {
+            endpoints::names_match(&e.name, &selected.name)
+                && selected.container.is_some()
+                && e.container == selected.container
+        })
+    });
+    probe.attached_to_active = selected.is_some_and(|e| e.active && e.has_hush);
+    probe.effect_conflict = selected.is_some_and(|e| e.active && e.effect_conflict);
+    probe.enhancements_off = selected.is_some_and(|e| e.active && e.has_hush && e.enhancements_off);
 
     let own = std::process::id();
     let mut keys: Vec<u32> = Vec::new();
     for endpoint in &active {
         let (id, name) = (&endpoint.id, &endpoint.name);
-        let pids = cache.active_sessions(enumerator, id);
-        if endpoints::names_match(name, mic) {
+        let here = id.eq_ignore_ascii_case(target);
+        let pids = match cache.active_sessions(enumerator, id) {
+            Some(pids) => pids,
+            None if here => return None,
+            None => continue,
+        };
+        if here {
             if !pids.is_empty() {
                 probe.capturing_here = true;
             }
@@ -596,7 +649,7 @@ fn probe(enumerator: &IMMDeviceEnumerator, mic: &str, cache: &mut ProbeCache) ->
     let mut hasher = DefaultHasher::new();
     keys.hash(&mut hasher);
     probe.capture_key = hasher.finish();
-    probe
+    Some(probe)
 }
 
 // -- Background watcher --------------------------------------------------------------
@@ -667,7 +720,8 @@ impl IMMNotificationClient_Impl for DeviceEvents_Impl {
 }
 
 pub struct Update {
-    pub probe: Probe,
+    pub target: String,
+    pub probe: Option<Probe>,
     /// A capture device was added, removed or changed since the last update.
     pub devices_changed: bool,
 }
@@ -699,10 +753,11 @@ impl Watcher {
     pub fn poll(&self) -> Option<Update> {
         let mut latest: Option<Update> = None;
         while let Ok(update) = self.updates.try_recv() {
-            let changed = update.devices_changed || latest.as_ref().is_some_and(|l| l.devices_changed);
+            let changed =
+                update.devices_changed || latest.as_ref().is_some_and(|l| l.devices_changed);
             latest = Some(Update {
-                probe: update.probe,
                 devices_changed: changed,
+                ..update
             });
         }
         latest
@@ -723,52 +778,76 @@ fn worker(
     wake: impl Fn() + Send + 'static,
 ) {
     let com = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.is_ok();
-    let enumerator: Option<IMMDeviceEnumerator> =
-        unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) }.ok();
     let client: IMMNotificationClient = DeviceEvents { tx: events }.into();
-    if let Some(enumerator) = &enumerator {
-        unsafe {
-            let _ = enumerator.RegisterEndpointNotificationCallback(&client);
-        }
-    }
-    let mut last: Option<Probe> = None;
+    let mut enumerator: Option<IMMDeviceEnumerator> = None;
+    let mut last = None;
     let mut changed = false;
     let mut cache = ProbeCache::default();
-    if let Some(enumerator) = &enumerator {
-        'watch: loop {
-            match inbox.recv_timeout(Duration::from_secs(1)) {
-                Ok(Msg::Target(name)) => mic = name,
-                Ok(Msg::DeviceEvent) => changed = true,
-                Ok(Msg::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => break 'watch,
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
+    let mut retry_at = Instant::now();
+    'watch: loop {
+        match inbox.recv_timeout(Duration::from_secs(1)) {
+            Ok(Msg::Target(name)) => {
+                mic = name;
+                changed = true;
             }
-            // Let a burst of device events settle.
-            while let Ok(message) = inbox.try_recv() {
-                match message {
-                    Msg::Target(name) => mic = name,
-                    Msg::DeviceEvent => changed = true,
-                    Msg::Stop => break 'watch,
-                }
-            }
-            if changed {
-                cache.invalidate();
-            }
-            let current = probe(enumerator, &mic, &mut cache);
-            let differs = last.as_ref() != Some(&current);
-            if differs || changed {
-                let _ = outbox.send(Update {
-                    probe: current.clone(),
-                    devices_changed: changed,
-                });
-                wake();
-            }
-            last = Some(current);
-            changed = false;
+            Ok(Msg::DeviceEvent) => changed = true,
+            Ok(Msg::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => break 'watch,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
+        while let Ok(message) = inbox.try_recv() {
+            match message {
+                Msg::Target(name) => {
+                    mic = name;
+                    changed = true;
+                }
+                Msg::DeviceEvent => changed = true,
+                Msg::Stop => break 'watch,
+            }
+        }
+        if changed {
+            cache.invalidate();
+        }
+        if enumerator.is_none() && Instant::now() >= retry_at {
+            enumerator = unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) }.ok();
+            if let Some(device) = &enumerator {
+                unsafe {
+                    let _ = device.RegisterEndpointNotificationCallback(&client);
+                }
+                cache.invalidate();
+            } else {
+                retry_at = Instant::now() + RESCAN;
+            }
+        }
+        let current = enumerator
+            .as_ref()
+            .and_then(|device| probe(device, &mic, &mut cache));
+        if current.is_none() {
+            cache.invalidate();
+            if let Some(device) = enumerator.take() {
+                unsafe {
+                    let _ = device.UnregisterEndpointNotificationCallback(&client);
+                }
+                retry_at = Instant::now() + RESCAN;
+            }
+        }
+        if last.as_ref() != Some(&current) || changed {
+            let _ = outbox.send(Update {
+                target: mic.clone(),
+                probe: current.clone(),
+                devices_changed: changed,
+            });
+            wake();
+        }
+        last = Some(current);
+        changed = false;
+    }
+    if let Some(device) = enumerator {
         unsafe {
-            let _ = enumerator.UnregisterEndpointNotificationCallback(&client);
+            let _ = device.UnregisterEndpointNotificationCallback(&client);
         }
     }
+    drop(cache);
+    drop(client);
     if com {
         unsafe { CoUninitialize() };
     }
@@ -776,56 +855,18 @@ fn worker(
 
 // -- Repairs -------------------------------------------------------------------------
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RepairFile {
-    pub time_unix: u64,
-    pub result: String,
-    pub message: String,
-    pub endpoint: String,
-}
-
-pub fn parse_repair(text: &str) -> Option<RepairFile> {
-    let mut file = RepairFile {
-        time_unix: 0,
-        result: String::new(),
-        message: String::new(),
-        endpoint: String::new(),
-    };
-    for line in text.lines() {
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        let value = value.trim();
-        match key.trim() {
-            "time_unix" => file.time_unix = value.parse().unwrap_or(0),
-            "result" => file.result = value.to_string(),
-            "message" => file.message = value.to_string(),
-            "endpoint" => file.endpoint = value.to_string(),
-            _ => {}
-        }
-    }
-    (file.time_unix > 0 && !file.result.is_empty()).then_some(file)
-}
+pub use hush::repair_report::RepairReport as RepairFile;
 
 pub fn read_repair_file() -> Option<RepairFile> {
-    parse_repair(&std::fs::read_to_string(settings::settings_dir().join("repair.txt")).ok()?)
-}
-
-fn unix_now() -> u64 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+    RepairFile::read()
 }
 
 /// Runs a fixed command without a console window.
 fn run_hidden(program: &str, args: &[&str]) -> bool {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    std::process::Command::new(program)
-        .args(args)
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
+    hush::windows_setup_paths::system_tool(program)
+        .and_then(|mut command| command.args(args).creation_flags(CREATE_NO_WINDOW).output())
         .is_ok_and(|output| output.status.success())
 }
 
@@ -868,17 +909,24 @@ fn repair_blocking(kind: ActionKind, allow_uac: bool) -> Outcome {
         ActionKind::Repair => REPAIR_TASK,
         ActionKind::Restart => RESTART_TASK,
     };
-    let started = unix_now();
+    let generation = read_repair_file().map_or(0, |report| report.generation);
+    let operation = if kind == ActionKind::Restart {
+        "restart"
+    } else {
+        "repair"
+    };
     let fail = |message: &str| Outcome {
         success: false,
         message: message.to_string(),
     };
     if run_hidden("schtasks.exe", &["/run", "/tn", task]) {
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + Duration::from_secs(125);
         while Instant::now() < deadline {
-            if let Some(file) = read_repair_file().filter(|f| f.time_unix >= started) {
+            if let Some(file) =
+                read_repair_file().filter(|report| report.matches(generation, operation))
+            {
                 return Outcome {
-                    success: matches!(file.result.as_str(), "ok" | "repaired" | "restarted"),
+                    success: file.succeeded(),
                     message: file.message,
                 };
             }
@@ -896,14 +944,18 @@ fn repair_blocking(kind: ActionKind, allow_uac: bool) -> Outcome {
     let message = install_state::run_setup(args)
         .recv()
         .unwrap_or_else(|_| "Not completed.".into());
-    let success = message == "Done.";
-    let message = read_repair_file()
-        .filter(|f| f.time_unix >= started)
-        .map(|f| f.message)
-        .unwrap_or(message);
-    Outcome {
-        success,
-        message,
+    if let Some(report) = read_repair_file().filter(|report| report.matches(generation, operation))
+    {
+        Outcome {
+            success: report.succeeded(),
+            message: report.message,
+        }
+    } else {
+        fail(if message == "Done." {
+            "Setup returned without a repair result."
+        } else {
+            &message
+        })
     }
 }
 
@@ -930,6 +982,7 @@ mod tests {
                 same_name_active: true,
                 attached_to_active: true,
                 enhancements_off: false,
+                effect_conflict: false,
                 capturing_here: true,
                 capture_key: 1,
                 capture_other: None,
@@ -1003,7 +1056,11 @@ mod tests {
         let t0 = Instant::now();
         let step = monitor.step(&stale(), CFG, t0);
         assert_eq!(step.health, Health::NotProcessing);
-        assert_eq!(step.action, Some(ActionKind::Restart));
+        assert_eq!(step.action, None);
+        assert_eq!(
+            monitor.step(&stale(), CFG, t0 + secs(4)).action,
+            Some(ActionKind::Restart)
+        );
         monitor.action_finished(ActionKind::Restart, true, t0 + secs(5));
         // Still within the verification time: just waiting.
         let step = monitor.step(&stale(), CFG, t0 + secs(10));
@@ -1022,7 +1079,23 @@ mod tests {
         let mut changed = stale();
         changed.probe.capture_key = 2;
         let step = monitor.step(&changed, CFG, t0 + secs(401));
-        assert_eq!(step.action, Some(ActionKind::Restart));
+        assert_eq!(step.action, None);
+        assert_eq!(
+            monitor.step(&changed, CFG, t0 + secs(405)).action,
+            Some(ActionKind::Restart)
+        );
+    }
+
+    #[test]
+    fn stale_capture_before_suspend_does_not_count_as_continuous() {
+        let mut monitor = Monitor::default();
+        let t0 = Instant::now();
+        assert_eq!(monitor.step(&stale(), CFG, t0).action, None);
+        assert_eq!(monitor.step(&stale(), CFG, t0 + secs(60)).action, None);
+        assert_eq!(
+            monitor.step(&stale(), CFG, t0 + secs(64)).action,
+            Some(ActionKind::Restart)
+        );
     }
 
     #[test]
@@ -1034,7 +1107,10 @@ mod tests {
         let step = monitor.step(&snap, CFG, t0);
         assert_eq!(step.health, Health::EnhancementsOff);
         assert_eq!(step.action, None);
-        assert_eq!(step.notice, Some(Notice::EnhancementsOff("Mic (USB)".into())));
+        assert_eq!(
+            step.notice,
+            Some(Notice::EnhancementsOff("Mic (USB)".into()))
+        );
         assert!(step.health.needs_attention());
         // Still no action, no second toast, and never "bypassed".
         for later in [20, 70, 400] {
@@ -1065,7 +1141,10 @@ mod tests {
         let t0 = Instant::now();
         let mut missing = healthy();
         missing.probe.attached_to_active = false;
-        assert_eq!(monitor.step(&missing, CFG, t0).action, Some(ActionKind::Repair));
+        assert_eq!(
+            monitor.step(&missing, CFG, t0).action,
+            Some(ActionKind::Repair)
+        );
         monitor.action_finished(ActionKind::Repair, false, t0 + secs(5));
         // At most one attempt per 2 minutes.
         assert_eq!(monitor.step(&missing, CFG, t0 + secs(60)).action, None);
@@ -1102,8 +1181,9 @@ mod tests {
             ..CFG
         };
         assert_eq!(monitor.step(&stale(), held, t0).action, None);
+        assert_eq!(monitor.step(&stale(), CFG, t0 + secs(1)).action, None);
         assert_eq!(
-            monitor.step(&stale(), CFG, t0 + secs(1)).action,
+            monitor.step(&stale(), CFG, t0 + secs(5)).action,
             Some(ActionKind::Restart)
         );
     }
@@ -1118,10 +1198,7 @@ mod tests {
         };
         let mut missing = healthy();
         missing.probe.attached_to_active = false;
-        for (snap, health) in [
-            (missing, Health::Missing),
-            (stale(), Health::NotProcessing),
-        ] {
+        for (snap, health) in [(missing, Health::Missing), (stale(), Health::NotProcessing)] {
             let step = monitor.step(&snap, off, t0);
             assert_eq!(step.health, health);
             assert_eq!(step.action, None);
@@ -1144,13 +1221,13 @@ mod tests {
 
     #[test]
     fn repair_file_is_parsed() {
-        let file = parse_repair(
+        let file = RepairFile::parse(
             "time_unix = 1700000000\nresult = repaired\nmessage = Done it.\nendpoint = abc\n",
         )
         .unwrap();
         assert_eq!(file.time_unix, 1_700_000_000);
         assert_eq!(file.result, "repaired");
         assert_eq!(file.message, "Done it.");
-        assert_eq!(parse_repair("nothing useful"), None);
+        assert_eq!(RepairFile::parse("nothing useful"), None);
     }
 }

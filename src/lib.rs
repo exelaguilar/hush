@@ -5,4 +5,16 @@
 
 pub mod virtual_output;
 
+#[cfg(windows)]
+pub mod machine_state;
+
+#[cfg(windows)]
+pub mod repair_report;
+
+#[cfg(windows)]
+pub mod device_registry;
+
+#[cfg(windows)]
+pub mod windows_setup_paths;
+
 pub const APP_NAME: &str = "Hush";

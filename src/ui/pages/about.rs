@@ -44,7 +44,7 @@ impl HushApp {
                 theme::hint(
                     ui,
                     &format!(
-                        "Clean Mic's CPU use: {}.{}% of one core",
+                        "Estimated Clean Mic load: {}.{}% of one core",
                         permille / 10,
                         permille % 10
                     ),

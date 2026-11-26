@@ -28,15 +28,17 @@ driver, and the audio is processed once however many apps are listening.
 | `hush-setup.exe` | Attaches the plugin to a microphone, removes it, reports status and repairs it. |
 | `Hush-Setup-<version>.exe` | The installer, which embeds the three files above. |
 
-The app and the plugin communicate only through files in `%ProgramData%\Hush`:
+The app and plugin use `%ProgramData%\Hush` for tuning and
+`%ProgramData%\HushRuntime` for engine output:
 
 | File | Purpose |
 | --- | --- |
 | `mic.conf` | Settings. Written by the app and polled by the plugin every 250 ms. |
 | `status.txt` | Heartbeat written by the plugin once a second while audio flows, with its own CPU use over that second. |
 | `live.bin` | Memory-mapped meter levels, updated 20 times a second. |
-| `installed.txt` | Record of every registry value Setup wrote, used for uninstall and repair. |
-| `repair.txt` | Result of the last repair. |
+
+Setup stores the installed endpoint record and repair results under
+`HKLM\SOFTWARE\Exel\Hush`.
 
 App preferences such as startup, tray, mute hotkey and notifications live in
 `%APPDATA%\Hush\app.conf`.
@@ -79,8 +81,8 @@ its last device scan until Windows reports a change:
 Repairs run through two on-demand scheduled tasks that Setup creates. They
 run as SYSTEM and have fixed command lines:
 
-- `\Hush\Repair Clean Mic` runs `repair --quiet`.
-- `\Hush\Restart Clean Mic` runs `repair --restart-audio --quiet`.
+- `\Hush\Repair Clean Mic` runs `repair --quiet --scheduled`.
+- `\Hush\Restart Clean Mic` runs `repair --restart-audio --quiet --scheduled`.
 
 A standard user may start these tasks but not change them. They are only
 created when `hush-setup.exe` runs from `%ProgramFiles%\Hush`. Automatic
@@ -98,7 +100,7 @@ now** can fall back to an elevated repair once.
   effects.
 - To capture detailed plugin traces, create `%ProgramData%\Hush\debug.flag`
   and restart Windows Audio. Traces then go to
-  `%ProgramData%\Hush\apo-trace.log`.
+  `%ProgramData%\HushRuntime\apo-trace.log`.
 - Errors are logged to the Windows Application event log under the source
   `Hush`:
   ```powershell
@@ -130,8 +132,9 @@ installer.
 `Hush-Setup.exe /S` (or `--silent`) installs with no window, and must run
 elevated. It attaches Clean Mic to the microphone Hush already uses (else
 the first physical one), keeps your saved settings, does not launch the app,
-and exits 0 on success (1 on failure). Details are logged to
-`%TEMP%\Hush-Setup.log`.
+and exits 0 on success (1 if a requested attachment fails or setup fails).
+When the install directory is available, details are written to
+`%ProgramFiles%\Hush\install.log`.
 
 Releases: push a `vX.Y.Z` tag that matches the version in `Cargo.toml`.
 `.github/workflows/release.yml` builds and tests on Windows, then creates the

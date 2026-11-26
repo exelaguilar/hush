@@ -75,17 +75,17 @@ fn mtime(path: &std::path::Path) -> Option<SystemTime> {
 /// The microphone whose health is watched: the first one Clean Mic is
 /// installed on.
 fn health_target(state: &install_state::InstallState) -> String {
-    state.attached.first().cloned().unwrap_or_default()
+    state.capture_ids.first().cloned().unwrap_or_default()
 }
 
 /// The microphone the mute hotkey acts on: the one Clean Mic is installed
 /// on, else the first plugged-in microphone.
 fn mute_target(state: &install_state::InstallState) -> String {
-    state.attached.first().cloned().unwrap_or_else(|| {
-        endpoints::capture_endpoints()
+    state.capture_ids.first().cloned().unwrap_or_else(|| {
+        endpoints::physical_microphones()
             .into_iter()
-            .find(|e| e.active)
-            .map(|e| e.name)
+            .next()
+            .map(|e| e.id)
             .unwrap_or_default()
     })
 }
@@ -99,13 +99,18 @@ impl Agent {
         let mute = mute::Mute::new(&mute_mic, wake.clone());
         let watch = health::Watcher::new(&target, wake.clone());
         // Toast identity (name, icon, click handler) for notifications.
-        std::thread::spawn(notify::register);
+        let _ = std::thread::Builder::new()
+            .name("hush-toasts".into())
+            .spawn(notify::register);
         let wake_for_toggle = wake.clone();
         let tray = Tray::new(settings.enabled, false, wake);
         let mut agent = Self {
             enabled: settings.enabled,
             settings_mtime: mtime(&settings::settings_path()),
-            prefs: prefs::load(),
+            prefs: prefs::try_load().unwrap_or_else(|_| prefs::Prefs {
+                auto_repair: false,
+                ..prefs::Prefs::default()
+            }),
             prefs_mtime: mtime(&prefs::path()),
             state,
             state_checked: Instant::now(),
@@ -157,7 +162,7 @@ impl Agent {
             let pressed = self.toggle_pressed.clone();
             let wake = self.wake.clone();
             let on_press = move || {
-                pressed.store(true, Ordering::Release);
+                pressed.fetch_xor(true, Ordering::AcqRel);
                 wake();
             };
             match mute::Hotkey::register(self.prefs.toggle_key, on_press) {
@@ -168,8 +173,10 @@ impl Agent {
     }
 
     fn reload_prefs(&mut self) {
+        let Ok(loaded) = prefs::try_load() else {
+            return;
+        };
         self.prefs_mtime = mtime(&prefs::path());
-        let loaded = prefs::load();
         let hotkey_changed = loaded.mute_hotkey != self.prefs.mute_hotkey
             || loaded.mute_key != self.prefs.mute_key
             || loaded.toggle_hotkey != self.prefs.toggle_hotkey
@@ -181,9 +188,13 @@ impl Agent {
     }
 
     fn refresh_install_state(&mut self) {
-        self.state = install_state::read();
+        self.state.refresh();
         self.state_checked = Instant::now();
-        let mic = mute_target(&self.state);
+        let mic = if self.state.capture_ids.is_empty() && !self.mute_mic.is_empty() {
+            self.mute_mic.clone()
+        } else {
+            mute_target(&self.state)
+        };
         if mic != self.mute_mic {
             self.mute.set_device(&mic);
             self.mute_mic = mic;
@@ -224,11 +235,16 @@ impl Agent {
     }
 
     fn toggle_clean_mic(&mut self) {
-        let mut current = settings::load();
-        current.enabled = !current.enabled;
-        if settings::save(&current).is_ok() {
-            self.enabled = current.enabled;
-            self.settings_mtime = mtime(&settings::settings_path());
+        match settings::update(|before| {
+            let mut after = before;
+            after.enabled = !before.enabled;
+            (before, after)
+        }) {
+            Ok(current) => {
+                self.enabled = current.enabled;
+                self.settings_mtime = mtime(&settings::settings_path());
+            }
+            Err(error) => notify::show("Could not change Clean Mic", &error.to_string()),
         }
     }
 
@@ -249,10 +265,18 @@ impl Agent {
         if target != self.health.target {
             self.health.watch.set_target(&target);
             self.health.target = target;
+            self.health.probe = None;
+            self.health.current = health::Health::Healthy;
+            self.health.monitor.reset_capture();
         }
         if let Some(update) = self.health.watch.poll() {
-            self.health.probe = Some(update.probe);
+            if update.target == self.health.target {
+                self.health.probe = update.probe;
+            }
             if update.devices_changed {
+                if self.state.capture_ids.is_empty() {
+                    self.mute_mic.clear();
+                }
                 self.refresh_install_state();
                 self.mute.rescan();
             }
@@ -279,19 +303,24 @@ impl Agent {
             self.refresh_install_state();
         }
         let Some(probe) = self.health.probe.clone() else {
+            self.health.current = if !self.health.target.is_empty() {
+                health::Health::Unavailable
+            } else {
+                health::Health::Healthy
+            };
+            self.health.monitor.reset_capture();
             return;
         };
         let snapshot = health::Snapshot {
-            mic: self.health.target.clone(),
+            mic: self.state.attached.first().cloned().unwrap_or_default(),
             installed: !self.state.attached.is_empty(),
-            // mic.conf as written, so "Hold to hear original" counts as off.
             clean_mic_on: self.enabled,
             probe,
             live_age_ms,
         };
         let config = health::Config {
             auto_repair: self.prefs.auto_repair,
-            hold_pressed: false,
+            hold_pressed: settings::comparing(),
         };
         let step = self.health.monitor.step(&snapshot, config, now);
         self.health.current = step.health;
@@ -310,6 +339,8 @@ impl Agent {
             "Not installed"
         } else if !self.enabled {
             "Off"
+        } else if self.state.degraded {
+            "Processing degraded"
         } else if self.state.running {
             "Active"
         } else {
@@ -336,7 +367,9 @@ impl Agent {
     fn publish(&mut self) {
         let state = ipc::AgentState {
             health: self.health.current.clone(),
-            target: self.health.target.clone(),
+            target: self.state.attached.first().cloned().unwrap_or_default(),
+            target_id: self.health.target.clone(),
+            process_id: std::process::id(),
             repairing: self.health.repair_job.is_some(),
             repair_note: self.health.repair_note.clone(),
             hotkey_error: self.hotkey_error.clone(),
@@ -349,10 +382,12 @@ impl Agent {
                 .unwrap_or_default(),
         };
         if self.published.as_ref() != Some(&state) {
-            if let Err(error) = state.write() {
-                settings::trace(&format!("agent: could not write its state: {error}"));
+            match state.write() {
+                Ok(()) => self.published = Some(state),
+                Err(error) => {
+                    settings::trace(&format!("agent: could not write its state: {error}"))
+                }
             }
-            self.published = Some(state);
         }
     }
 
@@ -379,8 +414,10 @@ impl Agent {
         }
         let settings_mtime = mtime(&settings::settings_path());
         if settings_mtime != self.settings_mtime {
-            self.settings_mtime = settings_mtime;
-            self.enabled = settings::load().enabled;
+            if let Ok(loaded) = settings::try_load() {
+                self.settings_mtime = settings_mtime;
+                self.enabled = loaded.enabled;
+            }
         }
         if mtime(&prefs::path()) != self.prefs_mtime {
             self.reload_prefs();
@@ -435,15 +472,14 @@ pub fn run(open: bool, page: Option<String>) {
     let mut handles: Vec<HANDLE> = vec![wake_event.0];
     handles.extend(events.iter().map(|e| e.0));
     while !agent.quitting {
-        let result = unsafe {
-            MsgWaitForMultipleObjects(Some(&handles), false, 1000, QS_ALLINPUT)
-        };
+        let result = unsafe { MsgWaitForMultipleObjects(Some(&handles), false, 1000, QS_ALLINPUT) };
         match result.0.wrapping_sub(WAIT_OBJECT_0.0) {
             1 => agent.open_window(ipc::take_page_request().as_deref()),
-            2 => agent.start_repair(health::ActionKind::Repair, true, true),
-            3 => agent.start_repair(health::ActionKind::Restart, true, true),
+            2 => agent.start_repair(health::ActionKind::Repair, false, true),
+            3 => agent.start_repair(health::ActionKind::Restart, false, true),
             4 => agent.quitting = true,
             5 => agent.reload_prefs(),
+            _ if result == windows::Win32::Foundation::WAIT_FAILED => break,
             _ => {}
         }
         // The tray icon's window lives on this thread.

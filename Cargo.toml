@@ -5,7 +5,7 @@ default-members = [".", "apo"]
 
 [package]
 name = "hush"
-version = "1.2.0"
+version = "1.2.1"
 edition = "2021"
 description = "Lightweight clean-microphone app for Windows (noise removal, voice gate, voice EQ)"
 authors = ["Exel (https://exel.dev)"]
@@ -20,6 +20,9 @@ hound = "3.5"
 
 hush-apo = { path = "apo" }
 rtrb = "0.3"
+
+[dev-dependencies]
+hush-apo = { path = "apo", features = ["offline-experiments"] }
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.55"

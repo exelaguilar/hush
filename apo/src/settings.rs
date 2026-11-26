@@ -7,7 +7,9 @@
 
 use crate::dsp::MicSettings;
 use std::{
-    path::PathBuf,
+    fs::{self, File, OpenOptions},
+    io::{self, Read, Write},
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         OnceLock,
@@ -16,12 +18,119 @@ use std::{
 };
 
 pub const FILE_NAME: &str = "mic.conf";
+const MAX_CONFIG_BYTES: u64 = 64 * 1024;
+
+pub fn read_config(path: &Path) -> io::Result<String> {
+    let mut text = String::new();
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(0x0020_0000); // FILE_FLAG_OPEN_REPARSE_POINT
+    }
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "expected a regular configuration file",
+        ));
+    }
+    file.take(MAX_CONFIG_BYTES + 1).read_to_string(&mut text)?;
+    if text.len() as u64 > MAX_CONFIG_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "configuration is too large",
+        ));
+    }
+    Ok(text)
+}
+
+pub fn write_atomic(path: &Path, contents: &str) -> io::Result<()> {
+    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+    let (temp, mut file) = loop {
+        let n = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
+        let temp = path.with_extension(format!("{}.{}.tmp", std::process::id(), n));
+        match OpenOptions::new().write(true).create_new(true).open(&temp) {
+            Ok(file) => break (temp, file),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    };
+    let result = file.write_all(contents.as_bytes());
+    drop(file);
+    let result = result.and_then(|()| fs::rename(&temp, path));
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result
+}
+
+const COMPARE_TTL: Duration = Duration::from_secs(3);
+
+/// Takes `file`'s exclusive lock, waiting up to `wait` for another process
+/// (the agent, the window, or a watcher probing the compare lease) to let go.
+/// App processes only: never called inside the audio engine.
+pub fn lock_within(file: &File, wait: Duration) -> io::Result<()> {
+    let deadline = Instant::now() + wait;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(()),
+            Err(fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+fn compare_path() -> PathBuf {
+    settings_dir().join("compare.lock")
+}
+
+/// The window owns this lock only while comparison is held.
+pub struct CompareLease(File);
+
+impl CompareLease {
+    pub fn begin() -> io::Result<Self> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(compare_path())?;
+        // `comparing()` probes this lock briefly from other processes.
+        lock_within(&file, Duration::from_millis(250))?;
+        let lease = Self(file);
+        lease.renew()?;
+        Ok(lease)
+    }
+
+    pub fn renew(&self) -> io::Result<()> {
+        self.0.set_modified(SystemTime::now())
+    }
+}
+
+pub fn comparing() -> bool {
+    let Ok(file) = File::open(compare_path()) else {
+        return false;
+    };
+    let fresh = file
+        .metadata()
+        .and_then(|meta| meta.modified())
+        .is_ok_and(|modified| modified.elapsed().is_ok_and(|age| age < COMPARE_TTL));
+    fresh && matches!(file.try_lock(), Err(std::fs::TryLockError::WouldBlock))
+}
 
 pub fn settings_dir() -> PathBuf {
     std::env::var_os("ProgramData")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
         .join("Hush")
+}
+
+pub fn runtime_dir() -> PathBuf {
+    settings_dir().with_file_name("HushRuntime")
 }
 
 pub fn settings_path() -> PathBuf {
@@ -137,19 +246,75 @@ pub fn format(s: &MicSettings) -> String {
     )
 }
 
-/// Writes the settings file atomically (temp file + rename) so the audio
-/// engine never reads a half-written file.
-pub fn save(settings: &MicSettings) -> std::io::Result<()> {
-    let path = settings_path();
-    let temp = path.with_extension("tmp");
-    std::fs::write(&temp, format(settings))?;
-    std::fs::rename(&temp, &path)
+fn fields(text: &str) -> impl Iterator<Item = (&str, &str)> {
+    text.lines().filter_map(|line| {
+        let (key, value) = line.split('#').next()?.split_once('=')?;
+        Some((key.trim(), value.trim()))
+    })
+}
+
+/// Applies the changed keys in a snapshot to the latest settings on disk.
+pub fn update(
+    edit: impl FnOnce(MicSettings) -> (MicSettings, MicSettings),
+) -> io::Result<MicSettings> {
+    update_at(&settings_path(), edit)
+}
+
+fn update_at(
+    path: &Path,
+    edit: impl FnOnce(MicSettings) -> (MicSettings, MicSettings),
+) -> io::Result<MicSettings> {
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path.with_extension("lock"))?;
+    // The agent (tray, hotkey) and the window both edit settings.
+    lock_within(&lock, Duration::from_secs(2))?;
+    let mut text = match read_config(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => format(&MicSettings::default()),
+        Err(error) => return Err(error),
+    };
+    let (before, after) = edit(parse(&text));
+    let before = format(&before);
+    let after = format(&after);
+    let changes: Vec<_> = fields(&after)
+        .filter(|(key, value)| {
+            !fields(&before).any(|(old_key, old_value)| old_key == *key && old_value == *value)
+        })
+        .collect();
+    if !changes.is_empty() {
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text = text
+            .lines()
+            .filter(|line| {
+                !fields(line).any(|(key, _)| changes.iter().any(|(changed, _)| key == *changed))
+            })
+            .map(|line| format!("{line}\n"))
+            .collect();
+        for (key, value) in changes {
+            use std::fmt::Write as _;
+            let _ = writeln!(text, "{key} = {value}");
+        }
+        write_atomic(path, &text)?;
+    }
+    Ok(parse(&text))
+}
+
+pub fn try_load() -> io::Result<MicSettings> {
+    match read_config(&settings_path()) {
+        Ok(text) => Ok(parse(&text)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(MicSettings::default()),
+        Err(error) => Err(error),
+    }
 }
 
 pub fn load() -> MicSettings {
-    std::fs::read_to_string(settings_path())
-        .map(|text| parse(&text))
-        .unwrap_or_default()
+    try_load().unwrap_or_default()
 }
 
 /// Voice tone presets (what Sonar calls "presets"): values for the three EQ
@@ -298,7 +463,7 @@ pub fn current() -> Option<MicSettings> {
 pub const TRACE_FILE_NAME: &str = "apo-trace.log";
 
 pub fn trace_path() -> PathBuf {
-    settings_dir().join(TRACE_FILE_NAME)
+    runtime_dir().join(TRACE_FILE_NAME)
 }
 
 /// Writes to the Windows Application event log under the source
@@ -382,7 +547,7 @@ fn trace_file(message: &str) {
 pub const STATUS_FILE_NAME: &str = "status.txt";
 
 pub fn status_path() -> PathBuf {
-    settings_dir().join(STATUS_FILE_NAME)
+    runtime_dir().join(STATUS_FILE_NAME)
 }
 
 /// Counters updated by the real-time thread (atomics only) and written to
@@ -394,17 +559,20 @@ static STREAM_CHANNELS: AtomicU32 = AtomicU32::new(0);
 
 static FAULTED: AtomicBool = AtomicBool::new(false);
 static WORKER_FALLBACK: AtomicBool = AtomicBool::new(false);
+static STREAM_DEGRADED: AtomicBool = AtomicBool::new(false);
 
 /// Called from the real-time thread when processing panicked: the watcher
 /// thread logs it (no I/O on the real-time thread).
 pub fn report_fault() {
     FAULTED.store(true, Ordering::Relaxed);
+    STREAM_DEGRADED.store(true, Ordering::Relaxed);
 }
 
 /// Called from the real-time thread when denoising permanently falls back.
 /// The settings watcher records the event outside the callback.
 pub fn report_worker_fallback() {
     WORKER_FALLBACK.store(true, Ordering::Relaxed);
+    STREAM_DEGRADED.store(true, Ordering::Relaxed);
 }
 
 /// Called from the real-time thread.
@@ -424,6 +592,8 @@ fn unix_seconds() -> u64 {
 /// Parsed `status.txt`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EngineStatus {
+    pub flowing: Option<bool>,
+    pub degraded: bool,
     pub process_id: u32,
     pub processed_frames: u64,
     pub rate: u32,
@@ -440,6 +610,8 @@ pub struct EngineStatus {
 
 pub fn parse_status(text: &str) -> Option<EngineStatus> {
     let mut status = EngineStatus {
+        flowing: None,
+        degraded: false,
         process_id: 0,
         processed_frames: 0,
         rate: 0,
@@ -456,6 +628,8 @@ pub fn parse_status(text: &str) -> Option<EngineStatus> {
         };
         let value = value.trim();
         match key.trim() {
+            "flowing" => status.flowing = parse_bool(value),
+            "degraded" => status.degraded = parse_bool(value).unwrap_or(false),
             "process_id" => status.process_id = value.parse().ok()?,
             "processed_frames" => status.processed_frames = value.parse().ok()?,
             "rate" => status.rate = value.parse().ok()?,
@@ -504,10 +678,15 @@ impl CpuMeter {
     }
 }
 
-fn write_status(cpu_permille: Option<u32>) {
+pub fn reset_stream_fault() {
+    STREAM_DEGRADED.store(false, Ordering::Relaxed);
+}
+
+fn write_status(cpu_permille: Option<u32>, flowing: bool) {
     let cpu_line = cpu_permille
         .map(|value| format!("cpu_permille = {value}\n"))
         .unwrap_or_default();
+    let degraded = STREAM_DEGRADED.load(Ordering::Relaxed);
     let text = format!(
         "# Written by the Hush APO inside audiodg.exe\n\
          process_id = {}\n\
@@ -517,6 +696,8 @@ fn write_status(cpu_permille: Option<u32>) {
          updated_unix = {}\n\
          underruns = {}\n\
          skipped = {}\n\
+         flowing = {flowing}\n\
+         degraded = {degraded}\n\
          {}",
         std::process::id(),
         PROCESSED_FRAMES.load(Ordering::Relaxed),
@@ -530,8 +711,7 @@ fn write_status(cpu_permille: Option<u32>) {
     // Best effort: write to a temp file and rename so readers never see a
     // half-written file.
     let path = status_path();
-    let temp = path.with_extension("tmp");
-    let result = std::fs::write(&temp, text).and_then(|_| std::fs::rename(&temp, &path));
+    let result = write_atomic(&path, &text);
     if let Err(error) = result {
         static REPORTED: AtomicBool = AtomicBool::new(false);
         if !REPORTED.swap(true, Ordering::Relaxed) {
@@ -556,12 +736,20 @@ pub fn start_watcher() {
     STARTED.get_or_init(|| {
         let path = settings_path();
         let mut last: Option<SystemTime> = None;
-        let mut last_frames = u64::MAX;
+        let mut last_frames = 0;
+        let mut saved = MicSettings::default();
+        let mut last_compare = false;
         let mut load = move || {
-            if let Some(settings) = load_if_changed(&path, &mut last, |path| {
-                std::fs::read_to_string(path)
-            }) {
-                publish(&settings);
+            let changed = load_if_changed(&path, &mut last, read_config);
+            if let Some(settings) = changed {
+                saved = settings;
+            }
+            let compare = comparing();
+            if changed.is_some() || compare != last_compare {
+                last_compare = compare;
+                let mut effective = saved;
+                effective.enabled &= !compare;
+                publish(&effective);
             }
         };
         load();
@@ -569,12 +757,13 @@ pub fn start_watcher() {
             .name("hush-settings".into())
             .spawn(move || {
                 let mut live = LiveWriter::open();
-                let mut live_frames = u64::MAX;
+                let mut live_frames = 0;
                 let now = Instant::now();
                 let (mut next_settings, mut next_status) = (now, now);
                 let mut next_heartbeat = now + HEARTBEAT;
                 let mut idle_since: Option<Instant> = None;
                 let mut cpu = CpuMeter { last: None };
+                let mut was_flowing = false;
                 loop {
                     // While audio flows: live meter at 20 Hz. With no audio
                     // for a while the thread wakes only 4 times a second.
@@ -617,10 +806,11 @@ pub fn start_watcher() {
                         let flowing = frames != last_frames;
                         // Measured over the last second while audio flows.
                         let load = cpu.sample(now).filter(|_| flowing);
-                        if flowing || now >= next_heartbeat {
+                        if flowing || was_flowing != flowing || now >= next_heartbeat {
                             last_frames = frames;
                             next_heartbeat = now + HEARTBEAT;
-                            write_status(load);
+                            write_status(load, flowing);
+                            was_flowing = flowing;
                         }
                     }
                 }
@@ -670,7 +860,7 @@ const LIVE_MAGIC: u32 = 0x5653_4D4C; // "LMSV"
 const LIVE_SIZE: u64 = 32;
 
 pub fn live_path() -> PathBuf {
-    settings_dir().join(LIVE_FILE_NAME)
+    runtime_dir().join(LIVE_FILE_NAME)
 }
 
 static IN_PEAK: AtomicU32 = AtomicU32::new(0);
@@ -766,6 +956,7 @@ pub struct LiveReader {
     /// `updated_ms` of the last successful read and since when it is unchanged.
     last_updated: Option<(u64, Instant)>,
     last_remap: Instant,
+    invalid_since: Option<Instant>,
 }
 
 impl LiveReader {
@@ -780,6 +971,7 @@ impl LiveReader {
             remap_after,
             last_updated: None,
             last_remap: Instant::now(),
+            invalid_since: None,
         }
     }
 
@@ -795,12 +987,18 @@ impl LiveReader {
             if file.metadata().ok()?.len() < LIVE_SIZE {
                 return None;
             }
-            self.map = unsafe { memmap2::Mmap::map(&file) }.ok();
+            self.map = unsafe {
+                memmap2::MmapOptions::new()
+                    .len(LIVE_SIZE as usize)
+                    .map(&file)
+            }
+            .ok();
             self.last_remap = Instant::now();
         }
         let levels = Self::snapshot(self.map.as_ref()?);
+        let now = Instant::now();
         if let Some(levels) = levels {
-            let now = Instant::now();
+            self.invalid_since = None;
             match &mut self.last_updated {
                 Some((ms, since)) if *ms == levels.updated_ms => {
                     if now.saturating_duration_since(*since) >= self.remap_after
@@ -812,6 +1010,11 @@ impl LiveReader {
                 }
                 other => *other = Some((levels.updated_ms, now)),
             }
+        } else if now.saturating_duration_since(*self.invalid_since.get_or_insert(now))
+            >= self.remap_after
+            && now.saturating_duration_since(self.last_remap) >= self.remap_after
+        {
+            self.map = None;
         }
         levels
     }
@@ -850,6 +1053,64 @@ impl Default for LiveReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn concurrent_edit_waits_for_the_other_writer() {
+        let path =
+            std::env::temp_dir().join(format!("hush-config-wait-{}.conf", std::process::id()));
+        let lock_path = path.with_extension("lock");
+        let holder = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap();
+        holder.try_lock().unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            drop(holder);
+        });
+        let saved = update_at(&path, |before| {
+            (
+                before,
+                MicSettings {
+                    enabled: !before.enabled,
+                    ..before
+                },
+            )
+        })
+        .unwrap();
+        release.join().unwrap();
+        assert_eq!(saved.enabled, !MicSettings::default().enabled);
+        let _ = fs::remove_file(lock_path);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn merges_disjoint_edits_and_keeps_unknown_keys() {
+        let path = std::env::temp_dir().join(format!("hush-config-{}.conf", std::process::id()));
+        let baseline = MicSettings::default();
+        let mut window = baseline;
+        window.gain_db = 4.0;
+        write_atomic(&path, "enabled = on\nfuture_key = keep\n").unwrap();
+        update_at(&path, |before| {
+            (
+                before,
+                MicSettings {
+                    enabled: false,
+                    ..before
+                },
+            )
+        })
+        .unwrap();
+        let saved = update_at(&path, |_| (baseline, window)).unwrap();
+        assert!(!saved.enabled);
+        assert_eq!(saved.gain_db, 4.0);
+        assert!(read_config(&path).unwrap().contains("future_key = keep"));
+        let _ = fs::remove_file(path.with_extension("lock"));
+        let _ = fs::remove_file(path);
+    }
 
     #[test]
     fn round_trips_and_ignores_garbage() {

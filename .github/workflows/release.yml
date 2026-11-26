@@ -7,7 +7,7 @@ on:
       - "v*"
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: release-${{ github.ref }}
@@ -31,7 +31,7 @@ jobs:
       hash: ${{ steps.package.outputs.hash }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2
         with:
           key: release
@@ -45,21 +45,31 @@ jobs:
             echo "::error::Tag $GITHUB_REF_NAME does not match Cargo.toml version $cargo_version"
             exit 1
           fi
+          for manifest in apo/Cargo.toml installer/Cargo.toml; do
+            package_version="$(sed -n 's/^version = "\(.*\)"$/\1/p' "$manifest" | head -n 1)"
+            if [ "$version" != "$package_version" ]; then
+              echo "::error::$manifest version $package_version does not match the tag"
+              exit 1
+            fi
+          done
+          rustc -Vv
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - name: Build application and APO payloads
-        run: cargo build --release --workspace --exclude hush-installer
+        run: |
+          cargo build --locked --release -p hush --bin hush --bin hush-setup
+          cargo build --locked --release -p hush-apo
 
       - name: Build installer
         env:
           SM_PAYLOAD_DIR: ${{ github.workspace }}\target\release
-        run: cargo build --release -p hush-installer
+        run: cargo build --locked --release -p hush-installer
 
       - name: Test installer
         env:
           SM_PAYLOAD_DIR: ${{ github.workspace }}\target\release
           __COMPAT_LAYER: RunAsInvoker
-        run: cargo test --release -p hush-installer
+        run: cargo test --locked --release -p hush-installer
 
       - name: Package and checksum
         id: package
@@ -85,15 +95,22 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2
         with:
           key: test
 
       - name: Test workspace
-        run: cargo test --workspace --exclude hush-installer --all-targets
+        run: cargo test --locked --workspace --exclude hush-installer --all-targets
+
+      - name: Compare unchanged settings with the 1.2.0 DSP baseline
+        run: ./tools/check-pcm.ps1 -Baseline v1.2.0
 
   publish:
+    permissions:
+      contents: write
     needs: [build, test]
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -104,6 +121,16 @@ jobs:
         with:
           name: installer
           path: dist/
+
+      - name: Verify downloaded release assets
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+          HASH: ${{ needs.build.outputs.hash }}
+        run: |
+          name="Hush-Setup-$VERSION.exe"
+          actual="$(sha256sum "dist/$name" | cut -d ' ' -f 1)"
+          test "$actual" = "$HASH"
+          test "$(cat "dist/Hush-Setup-$VERSION.sha256")" = "$HASH  $name"
 
       - name: Release notes from CHANGELOG.md
         env:
@@ -126,7 +153,8 @@ jobs:
             END { if (started) print out }
           ' | cat -s > notes.md
           if ! grep -q '[^[:space:]]' notes.md; then
-            echo "No CHANGELOG.md section found for $VERSION" > notes.md
+            echo "::error::No CHANGELOG.md section found for $VERSION"
+            exit 1
           fi
           printf '\nSHA-256: `%s  Hush-Setup-%s.exe`\n' "$HASH" "$VERSION" >> notes.md
           cat notes.md
@@ -138,8 +166,26 @@ jobs:
         run: |
           files=("dist/Hush-Setup-$VERSION.exe" "dist/Hush-Setup-$VERSION.sha256")
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            # Keep any notes already on the release.
-            gh release upload "$GITHUB_REF_NAME" "${files[@]}" --clobber
+            # A re-run may only add assets an interrupted run did not upload.
+            # Anything already published must match this build byte for byte.
+            mkdir verified-release
+            published="$(gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets[].name')"
+            missing=()
+            for file in "${files[@]}"; do
+              name="$(basename "$file")"
+              if grep -qxF "$name" <<< "$published"; then
+                gh release download "$GITHUB_REF_NAME" --pattern "$name" --dir verified-release
+                if ! cmp --silent "$file" "verified-release/$name"; then
+                  echo "::error::Published $name differs from this build. Publish a new version instead."
+                  exit 1
+                fi
+              else
+                missing+=("$file")
+              fi
+            done
+            if [ "${#missing[@]}" -gt 0 ]; then
+              gh release upload "$GITHUB_REF_NAME" "${missing[@]}"
+            fi
           else
             gh release create "$GITHUB_REF_NAME" "${files[@]}" \
               --title "Hush $VERSION" --notes-file notes.md --verify-tag

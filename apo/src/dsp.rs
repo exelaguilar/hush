@@ -588,6 +588,7 @@ struct DeEsser {
     overall: f32,
     attack: f32,
     release: f32,
+    #[cfg(any(test, feature = "offline-experiments"))]
     reduction_mix: f32,
 }
 
@@ -608,6 +609,7 @@ impl DeEsser {
             overall: 0.0,
             attack: time_coeff(1.0, rate),
             release: time_coeff(60.0, rate),
+            #[cfg(any(test, feature = "offline-experiments"))]
             reduction_mix: 1.0,
         }
     }
@@ -626,11 +628,11 @@ impl DeEsser {
             let gain = (self.sibilance / reference)
                 .powf(1.0 / Self::RATIO - 1.0)
                 .max(Self::MAX_REDUCTION);
-            if self.reduction_mix == 1.0 {
-                gain
-            } else {
-                1.0 - (1.0 - gain) * self.reduction_mix
+            #[cfg(any(test, feature = "offline-experiments"))]
+            if self.reduction_mix != 1.0 {
+                return 1.0 - (1.0 - gain) * self.reduction_mix;
             }
+            gain
         } else {
             1.0
         }
@@ -918,6 +920,7 @@ impl CleanMic {
         if options.pre_eq_detector_mix.is_finite() {
             chain.auto_level.pre_eq_mix = options.pre_eq_detector_mix.clamp(0.0, 1.0);
         }
+        #[cfg(any(test, feature = "offline-experiments"))]
         if options.deesser_reduction_mix.is_finite() {
             chain.deesser.reduction_mix = options.deesser_reduction_mix.clamp(0.0, 1.0);
         }

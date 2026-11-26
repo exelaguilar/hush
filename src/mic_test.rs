@@ -1,8 +1,10 @@
 //! Microphone test for the Hush window: a live level meter, "hear
 //! myself" monitoring through the default playback device, and a 10-second
 //! record + playback. The microphone is opened like any other app opens it,
-//! so what you hear is exactly what Discord/games receive (cleaned by the
-//! APO when it is installed).
+//! so the preview includes the APO when it is installed.
+
+#[path = "mic_test_input.rs"]
+mod input;
 
 use anyhow::{anyhow, Context, Result};
 use cpal::{
@@ -41,6 +43,9 @@ struct Shared {
     monitor: AtomicBool,
     recording: Mutex<Recording>,
     playback: Mutex<Playback>,
+    monitor_queue: Mutex<Option<rtrb::Producer<f32>>>,
+    input_error: Mutex<Option<String>>,
+    output_error: Mutex<Option<String>>,
 }
 
 /// Linear-interpolating sample-rate converter for one mono stream.
@@ -73,87 +78,65 @@ impl Resampler {
 }
 
 pub struct MicTest {
-    _input: Stream,
+    input: Option<input::Capture>,
     /// Opened on first use (monitoring or playback), so a meter-only test
     /// never touches the speakers.
     output: RefCell<Option<Stream>>,
-    /// What opening the output needs: the monitor queue's reading end.
-    pending_output: RefCell<Option<rtrb::Consumer<f32>>>,
     shared: Arc<Shared>,
     input_rate: u32,
-    pub output_name: String,
-}
-
-fn find_input(host: &cpal::Host, name: &str) -> Result<cpal::Device> {
-    host.input_devices()?
-        .find(|d| d.name().ok().as_deref() == Some(name))
-        .ok_or_else(|| anyhow!("microphone \"{name}\" not found"))
 }
 
 impl MicTest {
-    pub fn start(device_name: &str) -> Result<Self> {
-        let host = cpal::default_host();
-        let input = find_input(&host, device_name)?;
-        let input_config = input.default_input_config()?;
-        if input_config.sample_format() != SampleFormat::F32 {
-            return Err(anyhow!(
-                "unsupported microphone format {:?}",
-                input_config.sample_format()
-            ));
-        }
-        let input_rate = input_config.sample_rate().0;
-        let in_channels = input_config.channels() as usize;
-
+    pub fn start(device_id: &str) -> Result<Self> {
         let shared = Arc::new(Shared {
             peak: AtomicU32::new(0),
             monitor: AtomicBool::new(false),
             recording: Mutex::new(Recording::default()),
             playback: Mutex::new(Playback::default()),
+            monitor_queue: Mutex::new(None),
+            input_error: Mutex::new(None),
+            output_error: Mutex::new(None),
         });
-        let (mut to_monitor, monitor_queue) =
-            rtrb::RingBuffer::<f32>::new(input_rate as usize / 2);
-
         let input_shared = shared.clone();
-        let input_config: StreamConfig = input_config.into();
-        let input_stream = input
-            .build_input_stream(
-                &input_config,
-                move |data: &[f32], _| {
-                    let monitoring = input_shared.monitor.load(Ordering::Relaxed);
-                    let mut recording = input_shared.recording.try_lock().ok();
-                    let mut peak = 0.0_f32;
-                    for frame in data.chunks_exact(in_channels.max(1)) {
-                        let mono = frame.iter().sum::<f32>() / frame.len() as f32;
-                        peak = peak.max(mono.abs());
-                        if monitoring {
-                            let _ = to_monitor.push(mono);
-                        }
-                        if let Some(recording) = recording.as_mut() {
-                            if recording.active && recording.samples.len() < recording.limit {
-                                recording.samples.push(mono);
-                            }
+        let errors = shared.clone();
+        let (input, input_rate) = input::Capture::start(
+            device_id,
+            move |data, channels, frames| {
+                let mut recording = input_shared.recording.try_lock().ok();
+                let monitoring = input_shared.monitor.load(Ordering::Relaxed);
+                let mut queue = monitoring
+                    .then(|| input_shared.monitor_queue.try_lock().ok())
+                    .flatten();
+                let mut peak = 0.0_f32;
+                for i in 0..frames {
+                    let mono = if data.is_empty() {
+                        0.0
+                    } else {
+                        data[i * channels..(i + 1) * channels].iter().sum::<f32>() / channels as f32
+                    };
+                    peak = peak.max(mono.abs());
+                    if let Some(producer) = queue.as_deref_mut().and_then(Option::as_mut) {
+                        let _ = producer.push(mono);
+                    }
+                    if let Some(recording) = recording.as_mut() {
+                        if recording.active && recording.samples.len() < recording.limit {
+                            recording.samples.push(mono);
                         }
                     }
-                    input_shared.peak.store(peak.to_bits(), Ordering::Relaxed);
-                },
-                |error| eprintln!("microphone stream error: {error}"),
-                None,
-            )
-            .context("opening the microphone")?;
-
-        input_stream.play()?;
-        // Only the name for now; the device is opened on first use.
-        let output_name = host
-            .default_output_device()
-            .and_then(|device| device.name().ok())
-            .unwrap_or_default();
+                }
+                input_shared.peak.store(peak.to_bits(), Ordering::Relaxed);
+            },
+            move |error| {
+                if let Ok(mut state) = errors.input_error.lock() {
+                    *state = Some(error);
+                }
+            },
+        )?;
         Ok(Self {
-            _input: input_stream,
+            input: Some(input),
             output: RefCell::new(None),
-            pending_output: RefCell::new(Some(monitor_queue)),
             shared,
             input_rate,
-            output_name,
         })
     }
 
@@ -162,9 +145,8 @@ impl MicTest {
         if self.output.borrow().is_some() {
             return Ok(());
         }
-        let Some(mut monitor_queue) = self.pending_output.borrow_mut().take() else {
-            return Err(anyhow!("the playback device could not be opened"));
-        };
+        let (producer, mut monitor_queue) =
+            rtrb::RingBuffer::<f32>::new(self.input_rate as usize / 2);
         let output = cpal::default_host()
             .default_output_device()
             .ok_or_else(|| anyhow!("no playback device"))?;
@@ -180,6 +162,7 @@ impl MicTest {
         let out_channels = output_config.channels() as usize;
         let max_queue = input_rate as usize * MONITOR_MAX_QUEUE_MS / 1000;
         let output_shared = self.shared.clone();
+        let errors = self.shared.clone();
         let mut monitor_resampler = Resampler::new(input_rate, output_rate);
         let mut playback_resampler = Resampler::new(input_rate, output_rate);
         let output_config: StreamConfig = output_config.into();
@@ -220,13 +203,46 @@ impl MicTest {
                         }
                     }
                 },
-                |error| eprintln!("playback stream error: {error}"),
+                move |error| {
+                    if let Ok(mut state) = errors.output_error.lock() {
+                        *state = Some(format!("Playback stopped: {error}"));
+                    }
+                },
                 None,
             )
             .context("opening the playback device")?;
         output_stream.play()?;
+        *self
+            .shared
+            .monitor_queue
+            .lock()
+            .map_err(|_| anyhow!("Monitor queue unavailable"))? = Some(producer);
         *self.output.borrow_mut() = Some(output_stream);
         Ok(())
+    }
+
+    pub fn is_running(&self) -> bool {
+        self.input.is_some()
+    }
+
+    pub fn stop_input(&mut self) {
+        self.input = None;
+        self.shared.monitor.store(false, Ordering::Relaxed);
+        self.stop_recording();
+    }
+
+    pub fn poll_error(&mut self) -> Option<String> {
+        let input = self.shared.input_error.lock().ok()?.take();
+        if input.is_some() {
+            self.stop_input();
+        }
+        let output = self.shared.output_error.lock().ok()?.take();
+        if output.is_some() {
+            *self.output.borrow_mut() = None;
+            self.shared.monitor.store(false, Ordering::Relaxed);
+            self.stop_playback();
+        }
+        input.or(output)
     }
 
     /// Peak of the latest input buffer, 0..1.
@@ -245,7 +261,11 @@ impl MicTest {
 
     pub fn start_recording(&self) {
         self.stop_playback();
-        let mut recording = self.shared.recording.lock().unwrap();
+        let mut recording = self
+            .shared
+            .recording
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         recording.samples = Vec::with_capacity(self.input_rate as usize * RECORD_SECONDS);
         recording.limit = self.input_rate as usize * RECORD_SECONDS;
         recording.active = true;
@@ -253,7 +273,11 @@ impl MicTest {
 
     /// Fraction of the recording done, or `None` when not recording.
     pub fn recording_progress(&self) -> Option<f32> {
-        let mut recording = self.shared.recording.lock().unwrap();
+        let mut recording = self
+            .shared
+            .recording
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if !recording.active {
             return None;
         }
@@ -265,17 +289,37 @@ impl MicTest {
     }
 
     pub fn stop_recording(&self) {
-        self.shared.recording.lock().unwrap().active = false;
+        self.shared
+            .recording
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .active = false;
     }
 
     pub fn has_recording(&self) -> bool {
-        !self.shared.recording.lock().unwrap().samples.is_empty()
+        !self
+            .shared
+            .recording
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .samples
+            .is_empty()
     }
 
     pub fn play_recording(&self) -> Result<()> {
         self.open_output()?;
-        let samples = self.shared.recording.lock().unwrap().samples.clone();
-        let mut playback = self.shared.playback.lock().unwrap();
+        let samples = self
+            .shared
+            .recording
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .samples
+            .clone();
+        let mut playback = self
+            .shared
+            .playback
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         playback.samples = samples;
         playback.position = 0;
         playback.playing = true;
@@ -285,7 +329,13 @@ impl MicTest {
     /// Saves the last recording as a WAV file in Documents\Hush Recordings
     /// and returns its path.
     pub fn save_recording(&self) -> Result<std::path::PathBuf> {
-        let samples = self.shared.recording.lock().unwrap().samples.clone();
+        let samples = self
+            .shared
+            .recording
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .samples
+            .clone();
         if samples.is_empty() {
             return Err(anyhow!("nothing recorded yet"));
         }
@@ -311,33 +361,20 @@ impl MicTest {
     }
 
     pub fn stop_playback(&self) {
-        self.shared.playback.lock().unwrap().playing = false;
+        self.shared
+            .playback
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .playing = false;
     }
 
     pub fn is_playing(&self) -> bool {
-        self.shared.playback.lock().unwrap().playing
+        self.shared
+            .playback
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .playing
     }
-}
-
-/// Physical microphones (excludes Hush's and other products'
-/// virtual devices), in system order.
-pub fn microphones() -> Vec<String> {
-    use hush::virtual_output::{
-        is_hush_virtual_input, is_hush_virtual_output, is_third_party_virtual_endpoint,
-    };
-    cpal::default_host()
-        .input_devices()
-        .map(|devices| {
-            devices
-                .filter_map(|d| d.name().ok())
-                .filter(|n| {
-                    !is_third_party_virtual_endpoint(n)
-                        && !is_hush_virtual_input(n)
-                        && !is_hush_virtual_output(n)
-                })
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 /// `Documents\Hush Recordings` in the user's real Documents folder, which

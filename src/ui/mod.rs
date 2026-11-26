@@ -92,9 +92,6 @@ struct TestState {
 struct HealthState {
     agent: ipc::AgentState,
     agent_running: bool,
-    /// "Fix now" was sent to the agent at this time (spinner until the
-    /// agent reports the repair).
-    requested: Option<Instant>,
     /// "Fix now" run by the window itself, when no agent is running.
     local_job: Option<(health::ActionKind, mpsc::Receiver<health::Outcome>)>,
     local_note: Option<String>,
@@ -106,11 +103,7 @@ impl HealthState {
     }
 
     fn repairing(&self) -> bool {
-        self.agent.repairing
-            || self.local_job.is_some()
-            || self
-                .requested
-                .is_some_and(|at| at.elapsed() < Duration::from_secs(2))
+        self.agent.repairing || self.local_job.is_some()
     }
 
     fn note(&self) -> Option<&str> {
@@ -138,13 +131,15 @@ pub struct HushApp {
     settings: MicSettings,
     /// mic.conf's modification time as last read or written here.
     settings_mtime: Option<SystemTime>,
+    saved_settings: MicSettings,
     dirty_since: Option<Instant>,
     save_error: Option<String>,
     prefs: prefs::Prefs,
     start_with_windows: bool,
     prefs_error: Option<String>,
-    mics: Vec<String>,
+    mics: Vec<crate::endpoints::Endpoint>,
     selected_mic: String,
+    setup_clipboard_note: Option<&'static str>,
     state: install_state::InstallState,
     state_checked: Instant,
     synced: Instant,
@@ -152,7 +147,7 @@ pub struct HushApp {
     test_state: TestState,
     live: settings::LiveReader,
     live_levels: Option<settings::LiveLevels>,
-    comparing: bool,
+    compare: Option<(settings::CompareLease, Instant, Page)>,
     /// "Reset to defaults" was clicked once; a second click within a few
     /// seconds confirms it.
     reset_armed: Option<Instant>,
@@ -176,13 +171,11 @@ pub struct HushApp {
 
 /// The microphone Hush selects on start: the first one Clean Mic is
 /// installed on, else the first one found.
-fn default_mic(state: &install_state::InstallState, mics: &[String]) -> String {
-    state
-        .attached
-        .first()
-        .filter(|name| mics.contains(name))
-        .cloned()
-        .or_else(|| mics.first().cloned())
+fn default_mic(state: &install_state::InstallState, mics: &[crate::endpoints::Endpoint]) -> String {
+    mics.iter()
+        .find(|mic| state.capture_ids.contains(&mic.id))
+        .or_else(|| mics.first())
+        .map(|mic| mic.id.clone())
         .unwrap_or_default()
 }
 
@@ -247,6 +240,7 @@ pub fn run(page: Option<String>) -> eframe::Result {
 impl HushApp {
     pub fn new(ctx: &egui::Context, page: Option<&str>) -> Self {
         theme::install(ctx);
+        ctx.add_plugin(crate::clipboard::SystemClipboard);
         if let Some(preference) = dev::theme() {
             ctx.set_theme(preference);
         }
@@ -263,17 +257,20 @@ impl HushApp {
 
         let settings = settings::load();
         let state = install_state::read();
-        let mics = mic_test::microphones();
+        let mics = crate::endpoints::physical_microphones();
         let selected_mic = default_mic(&state, &mics);
         let mute = mute::Mute::new(&selected_mic, wake);
+        let pending = ipc::take_page_request();
         let page = dev::page()
             .as_deref()
+            .or(pending.as_deref())
             .or(page)
             .and_then(Page::from_id)
             .unwrap_or(Page::Microphone);
         let mut app = Self {
             page,
             settings,
+            saved_settings: settings,
             settings_mtime: mtime(&settings::settings_path()),
             dirty_since: None,
             save_error: None,
@@ -282,6 +279,7 @@ impl HushApp {
             prefs_error: None,
             mics,
             selected_mic,
+            setup_clipboard_note: None,
             state,
             state_checked: Instant::now(),
             synced: Instant::now() - SYNC_EVERY,
@@ -306,7 +304,7 @@ impl HushApp {
             },
             live: settings::LiveReader::new(),
             live_levels: None,
-            comparing: false,
+            compare: None,
             reset_armed: None,
             logo: None,
             shot: dev::shot_path().map(|path| (path, Instant::now(), false)),
@@ -320,7 +318,6 @@ impl HushApp {
             health: HealthState {
                 agent: ipc::AgentState::default(),
                 agent_running: false,
-                requested: None,
                 local_job: None,
                 local_note: None,
             },
@@ -354,10 +351,10 @@ impl HushApp {
     /// Rescans microphones and Clean Mic installs. Keeps the selection when
     /// that microphone is still there.
     fn refresh_mics(&mut self) {
-        self.mics = mic_test::microphones();
-        self.state = install_state::read();
+        self.mics = crate::endpoints::physical_microphones();
+        self.state.refresh();
         self.state_checked = Instant::now();
-        if !self.mics.contains(&self.selected_mic) {
+        if !self.mics.iter().any(|mic| mic.id == self.selected_mic) {
             self.selected_mic = default_mic(&self.state, &self.mics);
             self.mute.set_device(&self.selected_mic);
             // The microphone being tested is gone.
@@ -406,7 +403,7 @@ impl HushApp {
         let report = diagnostics::Report {
             version: env!("CARGO_PKG_VERSION"),
             windows: &windows,
-            selected_mic: &self.selected_mic,
+            selected_mic: self.selected_mic_name().unwrap_or(""),
             attached: &self.state.attached,
             processing: self.state.running,
             status: status.as_ref(),
@@ -431,11 +428,7 @@ impl HushApp {
             return;
         }
         self.health.local_note = None;
-        if self.health.agent_running && ipc::request_repair(kind) {
-            self.health.requested = Some(Instant::now());
-        } else {
-            self.health.local_job = Some((kind, health::run_repair(kind, true)));
-        }
+        self.health.local_job = Some((kind, health::run_repair(kind, true)));
     }
 
     /// Re-reads the agent's state and picks up settings changed elsewhere
@@ -444,26 +437,23 @@ impl HushApp {
         self.synced = Instant::now();
         self.health.agent_running = ipc::agent_running();
         let agent = if self.health.agent_running {
-            ipc::AgentState::read().unwrap_or_default()
+            ipc::AgentState::read().unwrap_or_else(|| self.health.agent.clone())
         } else {
             ipc::AgentState::default()
         };
-        if agent.repairing {
-            self.health.requested = None;
-        }
         if agent.repairing != self.health.agent.repairing && !agent.repairing {
             // A repair just finished: show what changed.
-            self.state = install_state::read();
+            self.state.refresh();
             self.state_checked = Instant::now();
         }
         self.health.agent = agent;
         let settings_mtime = mtime(&settings::settings_path());
-        if settings_mtime != self.settings_mtime
-            && self.dirty_since.is_none()
-            && !self.comparing
-        {
-            self.settings_mtime = settings_mtime;
-            self.settings = settings::load();
+        if settings_mtime != self.settings_mtime && self.dirty_since.is_none() {
+            if let Ok(loaded) = settings::try_load() {
+                self.settings_mtime = settings_mtime;
+                self.settings = loaded;
+                self.saved_settings = loaded;
+            }
         }
     }
 
@@ -485,7 +475,7 @@ impl HushApp {
                         .unwrap_or_else(|| "The repair did not finish.".into()),
                 );
             }
-            self.state = install_state::read();
+            self.state.refresh();
             self.state_checked = Instant::now();
         }
     }
@@ -502,16 +492,23 @@ impl HushApp {
         }
     }
 
-    /// Saves immediately. While "hold to hear original" is pressed the
-    /// processing is bypassed without changing the visible setting.
+    /// Commits only the settings the user changed.
     fn save_now(&mut self) {
-        self.dirty_since = None;
-        let mut effective = self.settings;
-        effective.enabled = self.settings.enabled && !self.comparing;
-        self.save_error = settings::save(&effective)
-            .err()
-            .map(|e| format!("Could not save settings: {e}"));
-        self.settings_mtime = mtime(&settings::settings_path());
+        let before = self.saved_settings;
+        let after = self.settings;
+        match settings::update(|_| (before, after)) {
+            Ok(saved) => {
+                self.dirty_since = None;
+                self.saved_settings = saved;
+                self.settings = saved;
+                self.save_error = None;
+                self.settings_mtime = mtime(&settings::settings_path());
+            }
+            Err(error) => {
+                self.dirty_since = Some(Instant::now());
+                self.save_error = Some(format!("Could not save settings: {error}"));
+            }
+        }
     }
 
     fn show_window(&mut self, ctx: &egui::Context) {
@@ -521,6 +518,10 @@ impl HushApp {
     }
 
     fn start_test(&mut self) {
+        if self.selected_mic.is_empty() {
+            self.test_state.error = Some("Choose a connected microphone first.".into());
+            return;
+        }
         match mic_test::MicTest::start(&self.selected_mic) {
             Ok(test) => {
                 self.test_state.error = None;
@@ -543,7 +544,14 @@ impl HushApp {
 
     fn poll_background(&mut self) {
         if let Some(job) = &self.jobs.setup {
-            if let Ok(message) = job.try_recv() {
+            let result = match job.try_recv() {
+                Ok(message) => Some(message),
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    Some("Setup stopped before reporting a result.".into())
+                }
+                Err(mpsc::TryRecvError::Empty) => None,
+            };
+            if let Some(message) = result {
                 self.jobs.setup_message = Some(message);
                 self.jobs.setup = None;
                 self.refresh_mics();
@@ -587,11 +595,15 @@ impl HushApp {
         }
         // Slow safety net for the status file's "processing" flag.
         if self.state_checked.elapsed() >= Duration::from_secs(2) {
-            self.state = install_state::read();
+            self.state.refresh();
             self.state_checked = Instant::now();
         }
-        if let Some(test) = &self.test_state.mic {
-            let peak = test.peak();
+        if let Some(test) = &mut self.test_state.mic {
+            if let Some(error) = test.poll_error() {
+                self.test_state.monitor = false;
+                self.test_state.error = Some(error);
+            }
+            let peak = if test.is_running() { test.peak() } else { 0.0 };
             self.test_state.meter = if peak > self.test_state.meter {
                 peak
             } else {
@@ -600,16 +612,29 @@ impl HushApp {
         }
     }
 
+    fn selected_mic_name(&self) -> Option<&str> {
+        self.mics
+            .iter()
+            .find(|mic| mic.id == self.selected_mic)
+            .map(|mic| mic.name.as_str())
+    }
+
     fn attached_here(&self) -> bool {
-        self.state.attached.contains(&self.selected_mic)
+        self.state.capture_ids.contains(&self.selected_mic)
     }
 
     fn status(&self) -> (egui::Color32, &'static str) {
-        let p = theme::DARK;
+        let p = if self.ctx.theme() == egui::Theme::Dark {
+            theme::DARK
+        } else {
+            theme::LIGHT
+        };
         if !self.attached_here() {
             (egui::Color32::GRAY, "Not installed")
         } else if !self.settings.enabled {
             (egui::Color32::GRAY, "Off")
+        } else if self.state.degraded {
+            (p.warning, "Processing degraded")
         } else if self.state.running {
             (p.success, "Active")
         } else {
@@ -620,7 +645,7 @@ impl HushApp {
     /// Apps using the microphone right now, for the header ("Discord").
     fn apps_label(&self) -> Option<String> {
         let apps = &self.health.agent.apps;
-        let watched = self.health.target() == self.selected_mic;
+        let watched = self.health.agent.target_id == self.selected_mic;
         if !watched || apps.is_empty() {
             return None;
         }
@@ -685,6 +710,29 @@ impl eframe::App for HushApp {
             ctx.send_viewport_cmd(ViewportCommand::Close);
         }
         self.track_window(ctx);
+        let still_holding = ctx.input(|input| {
+            input.focused
+                && !input.viewport().close_requested()
+                && (input.pointer.primary_down()
+                    || input.key_down(egui::Key::Space)
+                    || input.key_down(egui::Key::Enter))
+        });
+        if !still_holding
+            || self
+                .compare
+                .as_ref()
+                .is_some_and(|(_, _, page)| self.page != *page)
+        {
+            self.compare = None;
+        } else if let Some((lease, renewed, _)) = &mut self.compare {
+            if renewed.elapsed() >= Duration::from_secs(1) {
+                if lease.renew().is_ok() {
+                    *renewed = Instant::now();
+                } else {
+                    self.compare = None;
+                }
+            }
+        }
         if ctx.input(|i| i.viewport().close_requested()) && !self.prefs.close_to_tray {
             // "Keep running in the tray" is off: closing quits Hush.
             ipc::signal(ipc::EV_QUIT);
@@ -706,23 +754,30 @@ impl eframe::App for HushApp {
             self.diag_copied = None;
         }
 
-        let busy = self.dirty_since.is_some()
-            || self.jobs.setup.is_some()
-            || self.jobs.update.is_some()
-            || self.diag_copied.is_some()
-            || self.health.repairing();
+        let busy =
+            self.jobs.setup.is_some() || self.jobs.update.is_some() || self.health.repairing();
         // Meters are drawn at 20 fps (the plugin's own update rate), and
         // only on the pages that show them; elsewhere live audio only moves
         // the "Talking" badge.
         let live = self.live_levels.is_some_and(|l| l.age_ms() < 1500);
         let meters = (live && self.page == Page::Noise)
-            || (self.test_state.mic.is_some() && self.page == Page::Test);
-        if busy || meters || self.comparing {
+            || (self
+                .test_state
+                .mic
+                .as_ref()
+                .is_some_and(mic_test::MicTest::is_running)
+                && self.page == Page::Test);
+        if meters || self.compare.is_some() {
             ctx.request_repaint_after(METER_FRAME);
-        } else if live || self.test_state.mic.is_some() {
+        } else if self.dirty_since.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        } else if live || busy {
             ctx.request_repaint_after(Duration::from_millis(250));
         } else {
             ctx.request_repaint_after(SYNC_EVERY);
+        }
+        if let Some(copied) = self.diag_copied {
+            ctx.request_repaint_after(Duration::from_secs(2).saturating_sub(copied.elapsed()));
         }
     }
 
@@ -789,8 +844,8 @@ impl eframe::App for HushApp {
 
 impl Drop for HushApp {
     fn drop(&mut self) {
-        if self.dirty_since.is_some() || self.comparing {
-            self.comparing = false;
+        self.compare = None;
+        if self.dirty_since.is_some() {
             self.save_now();
         }
         if self.shot.is_none() {

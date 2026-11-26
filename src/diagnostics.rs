@@ -63,7 +63,7 @@ pub fn text(report: &Report) -> String {
             if let Some(permille) = status.cpu_permille {
                 let _ = writeln!(
                     out,
-                    "Clean Mic CPU: {}.{}% of one core",
+                    "Estimated Clean Mic load: {}.{}% of one core",
                     permille / 10,
                     permille % 10
                 );
@@ -93,11 +93,7 @@ pub fn text(report: &Report) -> String {
     }
     let _ = writeln!(out, "Microphone muted: {}", yes_no(report.muted));
     let _ = writeln!(out, "Microphone health: {}", report.health);
-    let _ = writeln!(
-        out,
-        "Last repair: {}",
-        report.last_repair.unwrap_or("none")
-    );
+    let _ = writeln!(out, "Last repair: {}", report.last_repair.unwrap_or("none"));
     let _ = writeln!(out, "Repair tasks: {}", report.repair_tasks);
     out.push_str("Settings:\n");
     out.push_str(&settings::format(report.settings));
@@ -114,7 +110,12 @@ pub fn windows_version() -> String {
     let get = |name: &str| key.get_value::<String, _>(name).unwrap_or_default();
     let build = get("CurrentBuildNumber");
     let revision = key.get_value::<u32, _>("UBR").ok();
-    format_windows_version(&get("ProductName"), &get("DisplayVersion"), &build, revision)
+    format_windows_version(
+        &get("ProductName"),
+        &get("DisplayVersion"),
+        &build,
+        revision,
+    )
 }
 
 fn format_windows_version(

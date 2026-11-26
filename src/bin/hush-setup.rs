@@ -18,11 +18,11 @@
 //!   * registers its COM class + APO entry under HKLM\SOFTWARE\Classes
 //!   * adds 1-2 values to the chosen endpoint's FxProperties key, only if
 //!     those values are empty (another product's effect is never replaced)
-//!   * creates %ProgramData%\Hush (settings, status, install record)
+//!   * creates %ProgramData%\Hush (settings) and %ProgramData%\HushRuntime (status)
 //!   * restarts the Windows Audio service so the change takes effect
 //!
-//! Every value written is recorded in installed.txt; uninstall removes exactly
-//! those entries if they still hold Hush's data.
+//! Every value written is recorded in HKLM\SOFTWARE\Exel\Hush (Endpoints);
+//! uninstall removes Hush-owned slots by their live CLSID.
 
 #[cfg(not(windows))]
 fn main() {
@@ -38,13 +38,16 @@ fn main() {
 }
 
 #[cfg(windows)]
-#[path = "../windows_setup_paths.rs"]
-mod windows_setup_paths;
+use hush::windows_setup_paths;
 
 #[cfg(windows)]
 mod windows_main {
     use super::windows_setup_paths::{program_files, replace_file, system_tool};
     use anyhow::{anyhow, bail, Context, Result};
+    use hush::{
+        machine_state::{self, INSTALL_RECORD, REPAIR_REPORT},
+        repair_report::RepairReport,
+    };
     use hush_apo::{settings, CLSID_STRING, COPYRIGHT, DLL_NAME, FRIENDLY_NAME};
     use std::{
         fs,
@@ -58,17 +61,8 @@ mod windows_main {
     };
 
     const MMDEVICES: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio";
-    const PKEY_NAME: &str = "{a45c254e-df1c-4efd-8020-67d146a850e0},2";
-    const PKEY_DESCRIPTION: &str = "{b3f8fa53-0004-438e-9003-51a46e139bfc},6";
-    const PKEY_DISABLE_SYSFX: &str = "{1da5d803-d492-4edd-8c23-e0c0ffee7f0e},5";
-    const FX: &str = "{d04e05a6-594b-4fb6-a80d-01af5eed7d1d}";
-    const FX_MODES: &str = "{d3993a3f-99c2-4402-b5ec-a92a0367664b}";
-    /// Processing modes the endpoint effect runs in. Only the default mode,
-    /// exactly as SteelSeries Sonar's own endpoint effects are registered on
-    /// this machine (a configuration Windows demonstrably honours).
-    const MODES: [&str; 1] = ["{C18E2F7E-933D-4965-B7D1-1EEF228D2AF3}"];
+    use hush::device_registry::{Effect, FX, FX_MODES, MODES};
     const IID_IAUDIOPROCESSINGOBJECT: &str = "{FD7F2B29-24D0-4b5c-B177-592C39F9CA10}";
-    const INSTALL_RECORD: &str = "installed.txt";
 
     #[derive(Clone, Copy, PartialEq, Debug)]
     enum Flow {
@@ -98,6 +92,7 @@ mod windows_main {
         name: String,
         active: bool,
         effects_disabled: bool,
+        container: Option<String>,
     }
 
     fn hklm() -> RegKey {
@@ -115,28 +110,19 @@ mod windows_main {
             };
             let state: u32 = key.get_value("DeviceState").unwrap_or(0);
             let props = key.open_subkey_with_flags("Properties", KEY_READ).ok();
-            let get = |name: &str| -> String {
-                props
-                    .as_ref()
-                    .and_then(|p| p.get_value::<String, _>(name).ok())
-                    .unwrap_or_default()
-            };
-            let (short, description) = (get(PKEY_NAME), get(PKEY_DESCRIPTION));
-            let name = if description.is_empty() {
-                short
-            } else {
-                format!("{short} ({description})")
-            };
-            let effects_disabled = props
+            let name = props
                 .as_ref()
-                .and_then(|p| p.get_value::<u32, _>(PKEY_DISABLE_SYSFX).ok())
-                .is_some_and(|v| v == 1);
+                .and_then(hush::device_registry::label)
+                .unwrap_or_else(|| id.clone());
+            let container = props.as_ref().and_then(hush::device_registry::container);
+            let effects_disabled = hush::device_registry::enhancements_disabled(&key);
             list.push(Endpoint {
                 flow,
                 id,
                 name,
                 active: state == 1,
                 effects_disabled,
+                container,
             });
         }
         list.sort_by_key(|e| e.name.to_lowercase());
@@ -185,19 +171,14 @@ mod windows_main {
     /// Re-runs this exe elevated (one UAC prompt) and shows its output here.
     fn relaunch_elevated(args: &[String]) -> Result<()> {
         let exe = std::env::current_exe()?;
-        let log = std::env::temp_dir().join("hush-setup.log");
-        let _ = fs::remove_file(&log);
-        let mut forwarded: Vec<String> = args.to_vec();
-        forwarded.push("--log".into());
-        forwarded.push(log.display().to_string());
         let quote = |s: &str| format!("'{}'", s.replace('\'', "''"));
-        let arg_list = forwarded
+        let arg_list = args
             .iter()
             .map(|a| quote(&format!("\"{a}\"")))
             .collect::<Vec<_>>()
             .join(",");
         let script = format!(
-            "$p = Start-Process -FilePath {} -ArgumentList {} -Verb RunAs -Wait -PassThru -WindowStyle Hidden; exit $p.ExitCode",
+            "$ErrorActionPreference = 'Stop'; $p = Start-Process -FilePath {} -ArgumentList {} -Verb RunAs -Wait -PassThru -WindowStyle Hidden; if ($null -eq $p) {{ exit 1 }}; exit $p.ExitCode",
             quote(&exe.display().to_string()),
             arg_list
         );
@@ -208,9 +189,6 @@ mod windows_main {
             .creation_flags(0x0800_0000)
             .status()
             .context("launching elevated setup")?;
-        if let Ok(text) = fs::read_to_string(&log) {
-            print!("{text}");
-        }
         if !status.success() {
             bail!("elevated setup did not complete (cancelled or failed)");
         }
@@ -218,8 +196,7 @@ mod windows_main {
     }
 
     struct Out {
-        log: Option<PathBuf>,
-        /// Log to the file only, not stdout.
+        /// Suppress stdout for operations that report through machine state.
         mute: bool,
     }
 
@@ -229,12 +206,6 @@ mod windows_main {
             if !self.mute {
                 println!("{text}");
             }
-            if let Some(log) = &self.log {
-                use std::io::Write;
-                if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(log) {
-                    let _ = writeln!(file, "{text}");
-                }
-            }
         }
     }
 
@@ -242,35 +213,21 @@ mod windows_main {
         Ok(program_files()?.join("Hush"))
     }
 
-    /// Stops or starts Windows audio. Stopping goes through
-    /// AudioEndpointBuilder (which also stops its dependent, Audiosrv):
-    /// AudioEndpointBuilder caches each endpoint's FxProperties, so restarting
-    /// only Audiosrv does not pick up a newly attached effect. Starting Audiosrv
-    /// starts AudioEndpointBuilder first.
+    fn setup_guard() -> Result<fs::File> {
+        let dir = program_dir()?;
+        fs::create_dir_all(&dir)?;
+        super::windows_setup_paths::ensure_plain_dir(&dir)?;
+        super::windows_setup_paths::ensure_protected(&dir, true)?;
+        super::windows_setup_paths::setup_lock().context("Another Hush setup or repair is running")
+    }
+
     fn audio_service(out: &Out, start: bool) -> Result<()> {
-        let (verb, service, label) = if start {
-            ("start", "audiosrv", "starting Windows Audio")
+        out.line(if start {
+            "  Starting Windows Audio"
         } else {
-            (
-                "stop",
-                "audioendpointbuilder",
-                "stopping Windows Audio (and Endpoint Builder)",
-            )
-        };
-        out.line(format!("  {label}"));
-        let mut command = system_tool("net.exe")?;
-        command.args([verb, service]);
-        if !start {
-            command.arg("/y");
-        }
-        let output = command.output().context("running net")?;
-        let text = String::from_utf8_lossy(&output.stdout).to_string()
-            + &String::from_utf8_lossy(&output.stderr);
-        // "already started" / "not started" are fine.
-        if !output.status.success() && !text.contains("already") && !text.contains("not started") {
-            bail!("net {verb} {service} failed: {}", text.trim());
-        }
-        Ok(())
+            "  Stopping Windows Audio"
+        });
+        super::windows_setup_paths::audio_services(start).context("changing Windows Audio services")
     }
 
     fn with_audio_restart(
@@ -323,10 +280,6 @@ mod windows_main {
         ));
     }
 
-    fn record_path() -> PathBuf {
-        settings::settings_dir().join(INSTALL_RECORD)
-    }
-
     /// One FX value this tool created. `label` (the endpoint's friendly name
     /// when it was installed) is an optional 4th column; older records lack it.
     #[derive(Clone, Debug)]
@@ -335,13 +288,28 @@ mod windows_main {
         id: String,
         value: String,
         label: Option<String>,
+        container: Option<String>,
     }
 
     impl RecLine {
         fn render(&self) -> String {
-            match &self.label {
-                Some(label) => format!("{}\t{}\t{}\t{label}\n", self.flow.key(), self.id, self.value),
-                None => format!("{}\t{}\t{}\n", self.flow.key(), self.id, self.value),
+            match (&self.label, &self.container) {
+                (Some(label), Some(container)) => format!(
+                    "{}\t{}\t{}\t{label}\t{}\n",
+                    self.flow.key(),
+                    self.id,
+                    self.value,
+                    container
+                ),
+                (Some(label), None) => {
+                    format!(
+                        "{}\t{}\t{}\t{label}\n",
+                        self.flow.key(),
+                        self.id,
+                        self.value
+                    )
+                }
+                (None, _) => format!("{}\t{}\t{}\n", self.flow.key(), self.id, self.value),
             }
         }
     }
@@ -356,13 +324,38 @@ mod windows_main {
                     id: parts.next()?.to_string(),
                     value: parts.next()?.to_string(),
                     label: parts.next().filter(|l| !l.is_empty()).map(str::to_string),
+                    container: parts.next().filter(|l| !l.is_empty()).map(str::to_string),
                 })
             })
             .collect()
     }
 
     fn read_record() -> Vec<RecLine> {
-        parse_record(&fs::read_to_string(record_path()).unwrap_or_default())
+        match machine_state::read(INSTALL_RECORD) {
+            Ok(record) => parse_record(&record),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => live_record(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    fn live_record() -> Vec<RecLine> {
+        let mut record = Vec::new();
+        for flow in [Flow::Capture, Flow::Render] {
+            let endpoints = endpoints(flow).unwrap_or_default();
+            for attachment in attachments(flow, None).unwrap_or_default() {
+                let endpoint = endpoints.iter().find(|entry| entry.id == attachment.id);
+                for (value, _) in attachment.values {
+                    record.push(RecLine {
+                        flow,
+                        id: attachment.id.clone(),
+                        value,
+                        label: endpoint.map(|e| e.name.replace(['\t', '\r', '\n'], " ")),
+                        container: endpoint.and_then(|e| e.container.clone()),
+                    });
+                }
+            }
+        }
+        record
     }
 
     fn find_mic(query: &str) -> Result<Endpoint> {
@@ -501,13 +494,94 @@ mod windows_main {
     }
 
     fn write_record(text: &str) -> Result<()> {
-        use std::io::Write;
-        replace_file(&record_path(), |file| file.write_all(text.as_bytes()))
+        machine_state::write(INSTALL_RECORD, text)
             .context("saving the microphone installation record")
     }
 
-    fn install(out: &Out, mic: &str, slot: &str, restart: bool, replace_mic: bool) -> Result<()> {
+    fn set_acl(path: &Path, grants: &[&str]) -> Result<()> {
+        let status = system_tool("icacls.exe")?
+            .arg(path)
+            .arg("/grant:r")
+            .args(grants)
+            .stdout(std::process::Stdio::null())
+            .status()?;
+        if !status.success() {
+            bail!("could not set permissions on {}", path.display());
+        }
+        Ok(())
+    }
+
+    fn prepare_settings(out: &Out, initial_position: Option<bool>) -> Result<()> {
+        let settings_dir = super::windows_setup_paths::program_data()?.join("Hush");
+        fs::create_dir_all(&settings_dir)?;
+        let _settings_handle = super::windows_setup_paths::pin_directory(&settings_dir)?;
+        super::windows_setup_paths::ensure_protected(&settings_dir, false)?;
+        set_acl(
+            &settings_dir,
+            &[
+                "*S-1-5-32-545:(OI)(CI)M",
+                "*S-1-5-19:(OI)(CI)RX",
+                "*S-1-5-33:(OI)(CI)RX",
+                r"NT SERVICE\Audiosrv:(OI)(CI)RX",
+            ],
+        )?;
+        let runtime = settings_dir.with_file_name("HushRuntime");
+        fs::create_dir_all(&runtime)?;
+        let _runtime_handle = super::windows_setup_paths::pin_directory(&runtime)?;
+        super::windows_setup_paths::ensure_protected(&runtime, false)?;
+        set_acl(
+            &runtime,
+            &[
+                "*S-1-5-18:(OI)(CI)F",
+                "*S-1-5-32-544:(OI)(CI)F",
+                "*S-1-5-32-545:(OI)(CI)RX",
+                "*S-1-5-19:(OI)(CI)M",
+                "*S-1-5-33:(OI)(CI)M",
+                r"NT SERVICE\Audiosrv:(OI)(CI)M",
+            ],
+        )?;
+        let status = system_tool("icacls.exe")?
+            .arg(&runtime)
+            .arg("/inheritance:r")
+            .stdout(std::process::Stdio::null())
+            .status()?;
+        if !status.success() {
+            bail!(
+                "removing inherited permissions from {} failed",
+                runtime.display()
+            );
+        }
+        let settings_file = settings_dir.join(settings::FILE_NAME);
+        use std::io::Write as _;
+        match fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&settings_file)
+        {
+            Ok(mut file) => {
+                let mut defaults = hush_apo::dsp::MicSettings::default();
+                if let Some(desk) = initial_position {
+                    defaults.desk_mic = desk;
+                }
+                file.write_all(settings::format(&defaults).as_bytes())?;
+                out.line(format!("  created {}", settings_file.display()));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.into()),
+        }
+        Ok(())
+    }
+
+    fn install(
+        out: &Out,
+        mic: &str,
+        slot: &str,
+        restart: bool,
+        replace_mic: bool,
+        initial_position: Option<bool>,
+    ) -> Result<()> {
         let endpoint = find_mic(mic)?;
+        prepare_settings(out, initial_position)?;
         install_endpoint(out, &endpoint, slot, restart, replace_mic, &[])?;
         // The installer runs this from a staging folder and then creates the
         // tasks with the installed copy (`create-repair-tasks`).
@@ -608,32 +682,6 @@ mod windows_main {
             );
         }
 
-        let settings_dir = settings::settings_dir();
-        fs::create_dir_all(&settings_dir)?;
-        // Users may edit settings (the app runs unelevated). The audio engine
-        // runs as LOCAL SERVICE with a write-restricted token, so writing
-        // status.txt also needs the WRITE RESTRICTED and Audiosrv service SIDs.
-        for grant in [
-            "*S-1-5-32-545:(OI)(CI)M",
-            "*S-1-5-19:(OI)(CI)M",
-            "*S-1-5-33:(OI)(CI)M",
-            "NT SERVICE\\Audiosrv:(OI)(CI)M",
-        ] {
-            let status = system_tool("icacls.exe")?
-                .arg(&settings_dir)
-                .args(["/grant", grant])
-                .stdout(std::process::Stdio::null())
-                .status()?;
-            if !status.success() {
-                bail!("icacls {grant} failed on {}", settings_dir.display());
-            }
-        }
-        let settings_file = settings::settings_path();
-        if !settings_file.exists() {
-            fs::write(&settings_file, settings::format(&Default::default()))?;
-            out.line(format!("  created {}", settings_file.display()));
-        }
-
         with_audio_restart(out, restart, || {
             let target_dir = program_dir()?;
             fs::create_dir_all(&target_dir)?;
@@ -675,7 +723,9 @@ mod windows_main {
                         flow: endpoint.flow,
                         id: endpoint.id.clone(),
                         value: name.clone(),
-                        label: Some(endpoint.name.clone()).filter(|n| !n.is_empty()),
+                        label: Some(endpoint.name.replace(['\t', '\r', '\n'], " "))
+                            .filter(|n| !n.is_empty()),
+                        container: endpoint.container.clone(),
                     }
                     .render(),
                 );
@@ -734,9 +784,21 @@ mod windows_main {
             Ok(())
         })?;
         delete_repair_tasks(out);
-        let _ = fs::remove_file(record_path());
+        write_record("")?;
+        let _ = machine_state::delete(REPAIR_REPORT);
         if purge {
-            let _ = fs::remove_dir_all(settings::settings_dir());
+            let data_dir = super::windows_setup_paths::program_data()?.join("Hush");
+            if data_dir.exists() {
+                super::windows_setup_paths::ensure_plain_dir(&data_dir)?;
+                super::windows_setup_paths::ensure_protected(&data_dir, false)?;
+                fs::remove_dir_all(&data_dir).context("removing Hush settings")?;
+            }
+            let runtime_dir = data_dir.with_file_name("HushRuntime");
+            if runtime_dir.exists() {
+                super::windows_setup_paths::ensure_plain_dir(&runtime_dir)?;
+                super::windows_setup_paths::ensure_protected(&runtime_dir, false)?;
+                fs::remove_dir_all(runtime_dir).context("removing Hush runtime data")?;
+            }
             out.line("  deleted settings");
         }
         out.line("Done.");
@@ -854,17 +916,19 @@ mod windows_main {
 
     // ---- repair -----------------------------------------------------------
 
-    const REPAIR_FILE: &str = "repair.txt";
     const SETUP_EXE: &str = "hush-setup.exe";
     /// (task name, arguments). On demand only, run as SYSTEM; fixed command
     /// lines with no user-controlled input.
     const REPAIR_TASKS: [(&str, &str); 2] = [
-        (r"\Hush\Repair Clean Mic", "repair --quiet"),
-        (r"\Hush\Restart Clean Mic", "repair --restart-audio --quiet"),
+        (r"\Hush\Repair Clean Mic", "repair --quiet --scheduled"),
+        (
+            r"\Hush\Restart Clean Mic",
+            "repair --restart-audio --quiet --scheduled",
+        ),
     ];
     /// Administrators and SYSTEM: full. Authenticated Users: read + execute
     /// (may run the task, may not change it).
-    const TASK_SDDL: &str = "D:(A;;FA;;;BA)(A;;FA;;;SY)(A;;GRGX;;;AU)";
+    const TASK_SDDL: &str = "D:(A;;FA;;;BA)(A;;FA;;;SY)(A;;GRGX;;;IU)";
 
     /// A recorded Capture endpoint and the slot Hush was installed in.
     #[derive(Clone, Debug, PartialEq)]
@@ -872,6 +936,7 @@ mod windows_main {
         id: String,
         slot: String,
         label: Option<String>,
+        container: Option<String>,
     }
 
     /// Current state of one Capture endpoint.
@@ -881,18 +946,38 @@ mod windows_main {
         name: String,
         active: bool,
         has_hush: bool,
+        container: Option<String>,
+        effect_conflict: bool,
     }
 
     #[derive(Clone, Debug, PartialEq)]
     enum Step {
         /// Active and Hush is attached.
-        Ok { id: String, name: String },
+        Ok {
+            id: String,
+            name: String,
+        },
         /// Active but Hush's values are gone: write them again.
-        Rewrite { id: String, name: String, slot: String },
+        Rewrite {
+            id: String,
+            name: String,
+            slot: String,
+        },
         /// The mic came back as a different endpoint: attach there, forget `old`.
-        Migrate { old: String, new: String, name: String, slot: String },
+        Migrate {
+            old: String,
+            new: String,
+            name: String,
+            slot: String,
+        },
         /// Not present (or not decidable): leave it alone.
-        Waiting { name: String, ambiguous: bool },
+        Waiting {
+            name: String,
+            ambiguous: bool,
+        },
+        Conflict {
+            name: String,
+        },
     }
 
     impl Step {
@@ -912,8 +997,15 @@ mod windows_main {
         for rec in recorded {
             let current = snap.iter().find(|s| same_id(&s.id, &rec.id));
             if let Some(s) = current.filter(|s| s.active) {
-                steps.push(if s.has_hush {
-                    Step::Ok { id: s.id.clone(), name: s.name.clone() }
+                steps.push(if s.effect_conflict && rec.slot == "efx" {
+                    Step::Conflict {
+                        name: s.name.clone(),
+                    }
+                } else if s.has_hush {
+                    Step::Ok {
+                        id: s.id.clone(),
+                        name: s.name.clone(),
+                    }
                 } else {
                     Step::Rewrite {
                         id: s.id.clone(),
@@ -929,9 +1021,15 @@ mod windows_main {
                 .or_else(|| rec.label.clone())
                 .unwrap_or_default();
             if name.is_empty() {
-                steps.push(Step::Waiting { name, ambiguous: false });
+                steps.push(Step::Waiting {
+                    name,
+                    ambiguous: false,
+                });
                 continue;
             }
+            let container = current
+                .and_then(|e| e.container.as_ref())
+                .or(rec.container.as_ref());
             let candidates: Vec<&Snap> = snap
                 .iter()
                 .filter(|s| {
@@ -940,11 +1038,18 @@ mod windows_main {
                         && !taken.iter().any(|t| same_id(t, &s.id))
                 })
                 .collect();
-            let with_hush: Vec<&&Snap> = candidates.iter().filter(|s| s.has_hush).collect();
-            let without: Vec<&&Snap> = candidates.iter().filter(|s| !s.has_hush).collect();
-            let pool = if with_hush.is_empty() { without } else { with_hush };
+            let pool: Vec<&Snap> = candidates
+                .iter()
+                .copied()
+                .filter(|e| {
+                    !e.effect_conflict && container.is_some() && e.container.as_ref() == container
+                })
+                .collect();
             match pool.len() {
-                0 => steps.push(Step::Waiting { name, ambiguous: false }),
+                0 => steps.push(Step::Waiting {
+                    name,
+                    ambiguous: !candidates.is_empty(),
+                }),
                 1 => {
                     let new = pool[0].id.clone();
                     taken.push(new.clone());
@@ -955,7 +1060,10 @@ mod windows_main {
                         slot: rec.slot.clone(),
                     });
                 }
-                _ => steps.push(Step::Waiting { name, ambiguous: true }),
+                _ => steps.push(Step::Waiting {
+                    name,
+                    ambiguous: true,
+                }),
             }
         }
         steps
@@ -965,11 +1073,23 @@ mod windows_main {
     /// any registry change.
     fn summarize(steps: &[Step], restarted: bool) -> (&'static str, String) {
         if steps.is_empty() {
-            return ("ok", "No microphone is set up with Clean Mic.".into());
+            return ("waiting", "No microphone is set up with Clean Mic.".into());
+        }
+        if let Some(name) = steps.iter().find_map(|step| match step {
+            Step::Conflict { name } => Some(name),
+            _ => None,
+        }) {
+            return (
+                "conflict",
+                format!("The audio effects for {name} conflict with Clean Mic."),
+            );
         }
         let waiting_text = |step: &Step| match step {
-            Step::Waiting { name, ambiguous: true } => Some(format!(
-                "Several microphones are named {name}; open Hush and choose one."
+            Step::Waiting {
+                name,
+                ambiguous: true,
+            } => Some(format!(
+                "Several microphones may match {name}; open Hush and choose the intended device."
             )),
             Step::Waiting { name, .. } if name.is_empty() => {
                 Some("Waiting for the microphone to be connected.".to_string())
@@ -1001,64 +1121,28 @@ mod windows_main {
         if restarted && !active.is_empty() {
             return (
                 "restarted",
-                format!("Windows audio restarted; Clean Mic reloaded on {}.", active.join(", ")),
+                format!(
+                    "Windows audio restarted; Clean Mic reloaded on {}.",
+                    active.join(", ")
+                ),
             );
         }
         if !active.is_empty() {
-            return ("ok", format!("Clean Mic is attached to {}.", active.join(", ")));
+            return (
+                "ok",
+                format!("Clean Mic is attached to {}.", active.join(", ")),
+            );
         }
-        let message = steps.iter().filter_map(waiting_text).collect::<Vec<_>>().join(" ");
+        let message = steps
+            .iter()
+            .filter_map(waiting_text)
+            .collect::<Vec<_>>()
+            .join(" ");
         ("waiting", message)
     }
 
-    struct RepairReport {
-        time_unix: u64,
-        result: String,
-        message: String,
-        endpoint: String,
-    }
-
-    fn render_repair(report: &RepairReport) -> String {
-        let one_line = |s: &str| s.replace(['\r', '\n'], " ");
-        format!(
-            "time_unix = {}\nresult = {}\nmessage = {}\nendpoint = {}\n",
-            report.time_unix,
-            one_line(&report.result),
-            one_line(&report.message),
-            one_line(&report.endpoint)
-        )
-    }
-
-    fn parse_repair(text: &str) -> Option<RepairReport> {
-        let (mut time_unix, mut result, mut message, mut endpoint) =
-            (None, None, String::new(), String::new());
-        for line in text.lines() {
-            let Some((key, value)) = line.split_once('=') else {
-                continue;
-            };
-            let value = value.trim().to_string();
-            match key.trim() {
-                "time_unix" => time_unix = value.parse().ok(),
-                "result" => result = Some(value),
-                "message" => message = value,
-                "endpoint" => endpoint = value,
-                _ => {}
-            }
-        }
-        Some(RepairReport {
-            time_unix: time_unix?,
-            result: result?,
-            message,
-            endpoint,
-        })
-    }
-
-    fn repair_path() -> PathBuf {
-        settings::settings_dir().join(REPAIR_FILE)
-    }
-
     fn read_repair_file() -> Option<RepairReport> {
-        parse_repair(&fs::read_to_string(repair_path()).ok()?)
+        RepairReport::read()
     }
 
     fn now_unix() -> u64 {
@@ -1068,45 +1152,15 @@ mod windows_main {
             .unwrap_or(0)
     }
 
-    /// Atomic (temp + rename). The file inherits the directory's ACL, which
-    /// lets standard users read it.
     fn write_repair_file(report: &RepairReport) -> Result<()> {
-        use std::io::Write;
-        fs::create_dir_all(settings::settings_dir())?;
-        let text = render_repair(report);
-        replace_file(&repair_path(), |file| file.write_all(text.as_bytes()))
-            .context("writing repair.txt")
+        machine_state::write(REPAIR_REPORT, &report.render())
+            .context("saving the machine repair result")
     }
 
-    /// True when Hush's value is present in any slot (and, for the endpoint
-    /// effect slot, its processing modes too).
-    fn hush_present(flow: Flow, id: &str) -> bool {
-        let Ok(key) = hklm().open_subkey_with_flags(fx_path(flow, id), KEY_READ) else {
-            return false;
-        };
-        let modes: Vec<String> = MODES.iter().map(|m| m.to_string()).collect();
-        let want = modes.to_reg_value();
-        for slot in [1, 2, 7] {
-            let name = format!("{FX},{slot}");
-            let ours = matches!(
-                raw_value(&key, &name),
-                Ok(Some(v)) if v.to_string().eq_ignore_ascii_case(CLSID_STRING)
-            );
-            if !ours {
-                continue;
-            }
-            if slot == 7
-                && raw_value(&key, &format!("{FX_MODES},7"))
-                    .ok()
-                    .flatten()
-                    .as_ref()
-                    != Some(&want)
-            {
-                continue;
-            }
-            return true;
-        }
-        false
+    fn effect(e: &Endpoint) -> Effect {
+        hklm()
+            .open_subkey_with_flags(format!(r"{MMDEVICES}\{}\{}", e.flow.key(), e.id), KEY_READ)
+            .map_or(Effect::Missing, |key| hush::device_registry::effect(&key))
     }
 
     /// Capture endpoints from the install record, one per endpoint id.
@@ -1133,18 +1187,22 @@ mod windows_main {
                     if mic.label.is_none() {
                         mic.label = line.label;
                     }
+                    if mic.container.is_none() {
+                        mic.container = line.container;
+                    }
                 }
                 None => mics.push(RecMic {
                     id: line.id,
                     slot: slot.unwrap_or("efx").into(),
                     label: line.label,
+                    container: line.container,
                 }),
             }
         }
         mics
     }
 
-    fn repair_inner(out: &Out, restart_audio: bool) -> Result<RepairReport> {
+    fn repair_inner(out: &Out, restart_audio: bool, scheduled: bool) -> Result<RepairReport> {
         let list = endpoints(Flow::Capture)?;
         let snap: Vec<Snap> = list
             .iter()
@@ -1152,7 +1210,10 @@ mod windows_main {
                 id: e.id.clone(),
                 name: e.name.clone(),
                 active: e.active,
-                has_hush: e.active && hush_present(Flow::Capture, &e.id),
+                has_hush: e.active && effect(e) == Effect::Ready,
+                effect_conflict: e.active
+                    && matches!(effect(e), Effect::Conflict | Effect::Foreign),
+                container: e.container.clone(),
             })
             .collect();
         let steps = plan_repair(&recorded_mics(), &snap);
@@ -1160,6 +1221,15 @@ mod windows_main {
         let any_active = steps.iter().any(|s| matches!(s, Step::Ok { .. }));
         let restart = changed || (restart_audio && any_active);
         if restart {
+            if scheduled {
+                let last = machine_state::read("LastScheduledRestart")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok());
+                if last.is_some_and(|last| now_unix().saturating_sub(last) < 120) {
+                    bail!("Windows Audio was restarted recently. Try again in two minutes.");
+                }
+                machine_state::write("LastScheduledRestart", &now_unix().to_string())?;
+            }
             let find = |id: &str| {
                 list.iter()
                     .find(|e| same_id(&e.id, id))
@@ -1193,10 +1263,12 @@ mod windows_main {
             .find_map(|s| match s {
                 Step::Ok { id, .. } | Step::Rewrite { id, .. } => Some(id.clone()),
                 Step::Migrate { new, .. } => Some(new.clone()),
-                Step::Waiting { .. } => None,
+                Step::Waiting { .. } | Step::Conflict { .. } => None,
             })
             .unwrap_or_default();
         Ok(RepairReport {
+            generation: 0,
+            operation: String::new(),
             time_unix: now_unix(),
             result: result.into(),
             message,
@@ -1204,30 +1276,44 @@ mod windows_main {
         })
     }
 
-    fn repair(out: &Out, restart_audio: bool) -> Result<()> {
-        let quiet = Out {
-            log: out.log.clone(),
-            mute: true,
-        };
-        // Existing installs get the on-demand tasks on their first repair.
-        if let Err(error) = create_repair_tasks(&quiet) {
-            quiet.line(format!("warning: could not create the repair tasks: {error:#}"));
+    fn next_repair_generation() -> u64 {
+        read_repair_file().map_or(1, |report| report.generation.saturating_add(1))
+    }
+
+    fn repair_operation(restart_audio: bool) -> &'static str {
+        if restart_audio {
+            "restart"
+        } else {
+            "repair"
         }
-        match repair_inner(&quiet, restart_audio) {
-            Ok(report) => {
-                if let Err(error) = write_repair_file(&report) {
-                    quiet.line(format!("warning: {error:#}"));
-                }
+    }
+
+    /// Publishes a failed repair so the waiting app gets an answer instead of
+    /// timing out. Also used when the run could not start (setup lock busy).
+    fn record_repair_error(generation: u64, restart_audio: bool, error: &anyhow::Error) {
+        let _ = write_repair_file(&RepairReport {
+            generation,
+            operation: repair_operation(restart_audio).into(),
+            time_unix: now_unix(),
+            result: "error".into(),
+            message: format!("Repair failed: {error:#}"),
+            endpoint: String::new(),
+        });
+    }
+
+    fn repair(out: &Out, restart_audio: bool, scheduled: bool) -> Result<()> {
+        let quiet = Out { mute: true };
+        let generation = next_repair_generation();
+        match repair_inner(&quiet, restart_audio, scheduled) {
+            Ok(mut report) => {
+                report.generation = generation;
+                report.operation = repair_operation(restart_audio).into();
+                write_repair_file(&report)?;
                 out.line(format!("repair: {}: {}", report.result, report.message));
                 Ok(())
             }
             Err(error) => {
-                let _ = write_repair_file(&RepairReport {
-                    time_unix: now_unix(),
-                    result: "error".into(),
-                    message: format!("Repair failed: {error:#}"),
-                    endpoint: String::new(),
-                });
+                record_repair_error(generation, restart_audio, &error);
                 Err(error)
             }
         }
@@ -1324,6 +1410,13 @@ mod windows_main {
                 dir.display()
             );
         }
+        super::windows_setup_paths::ensure_protected(&exe, true)?;
+        if machine_state::read(INSTALL_RECORD)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        {
+            let record: String = live_record().iter().map(RecLine::render).collect();
+            write_record(&record)?;
+        }
         for (name, arguments) in REPAIR_TASKS {
             let xml = task_xml(&exe.display().to_string(), arguments);
             let mut bytes = vec![0xFF, 0xFE];
@@ -1364,7 +1457,9 @@ mod windows_main {
     /// Removes both tasks; a task that does not exist is fine.
     fn delete_repair_tasks(out: &Out) {
         for (name, _) in REPAIR_TASKS {
-            let Ok(mut command) = schtasks() else { continue };
+            let Ok(mut command) = schtasks() else {
+                continue;
+            };
             let removed = command
                 .args(["/delete", "/tn", name, "/f"])
                 .output()
@@ -1385,7 +1480,11 @@ mod windows_main {
         for (name, _) in REPAIR_TASKS {
             println!(
                 "Repair task {name}: {}",
-                if task_exists(name) { "present" } else { "missing" }
+                if task_exists(name) {
+                    "present"
+                } else {
+                    "missing"
+                }
             );
         }
     }
@@ -1393,81 +1492,86 @@ mod windows_main {
     /// Registry key for Windows' "Installed apps" entry (written by the installer).
     pub const UNINSTALL_KEY: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Hush";
 
-    fn start_menu_shortcut() -> PathBuf {
-        std::env::var_os("ProgramData")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
-            .join(r"Microsoft\Windows\Start Menu\Programs\Hush.lnk")
+    fn start_menu_shortcut() -> std::io::Result<PathBuf> {
+        Ok(super::windows_setup_paths::program_data()?
+            .join(r"Microsoft\Windows\Start Menu\Programs\Hush.lnk"))
     }
 
     /// Removes everything the Hush installer added: the APO and its
     /// settings, the running app, Start menu shortcut, autostart entry,
     /// "Installed apps" entry and the program folder.
-    fn uninstall_app(out: &Out, quiet: bool) -> Result<()> {
+    fn uninstall_app(out: &Out, quiet: bool, from_app: bool) -> Result<()> {
         out.line("Uninstalling Hush");
-        let _ = system_tool("taskkill.exe").and_then(|mut command| {
-            command
-                .args(["/im", "hush.exe", "/f"])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-        });
+        if !from_app {
+            super::windows_setup_paths::stop_installed_app(&program_dir()?.join("hush.exe"))?;
+        }
         uninstall(out, true, true)?;
 
-        let shortcut = start_menu_shortcut();
+        let shortcut = start_menu_shortcut()?;
         if fs::remove_file(&shortcut).is_ok() {
             out.line(format!("  removed {}", shortcut.display()));
         }
-        // Per-user parts (this process runs elevated as the same user).
-        if let Ok(run) = winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER)
-            .open_subkey_with_flags(
-                r"Software\Microsoft\Windows\CurrentVersion\Run",
-                KEY_READ | KEY_SET_VALUE,
-            )
-        {
-            if run.delete_value("Hush").is_ok() {
-                out.line("  removed Start with Windows entry");
-            }
-        }
-        if let Some(appdata) = std::env::var_os("APPDATA") {
-            let _ = fs::remove_dir_all(PathBuf::from(appdata).join("Hush"));
-        }
-        // The notification identity and the `hush:` link that opens Hush
-        // from a clicked notification (written by the app, see notify.rs).
-        let hkcu = winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER);
-        for key in [
-            r"Software\Classes\hush",
-            r"Software\Classes\AppUserModelId\Exel.Hush",
-        ] {
-            if hkcu.delete_subkey_all(key).is_ok() {
-                out.line(format!("  removed HKCU\\{key}"));
-            }
-        }
-        if hklm().delete_subkey_all(UNINSTALL_KEY).is_ok() {
-            out.line("  removed Installed apps entry");
-        }
 
-        // This exe lives in the program folder, so delete the folder after
-        // it exits.
         let dir = program_dir()?;
-        let _ = system_tool("cmd.exe")?
-            .args([
-                "/d",
-                "/c",
-                &format!(
-                    "ping 127.0.0.1 -n 3 > nul & rmdir /s /q \"{}\"",
-                    dir.display()
-                ),
-            ])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
-        out.line(format!("  removing {}", dir.display()));
-        out.line("Hush has been removed.");
+        let mut reboot = false;
+        for entry in fs::read_dir(&dir)? {
+            let entry = entry?;
+            if entry.file_type()?.is_file() {
+                let path = entry.path();
+                match fs::remove_file(&path) {
+                    Ok(()) => {}
+                    Err(error) if matches!(error.raw_os_error(), Some(5 | 32)) => {
+                        // Queue only the unique retired name, so a reinstall before
+                        // reboot cannot delete its newly installed executable.
+                        let retired = dir.with_file_name(format!(
+                            ".hush-retired-{}-{}-{}",
+                            std::process::id(),
+                            now_unix(),
+                            entry.file_name().to_string_lossy()
+                        ));
+                        fs::rename(&path, &retired).context("retiring the in-use program file")?;
+                        schedule_removal(&retired)?;
+                        reboot = true;
+                    }
+                    Err(error) => {
+                        return Err(error).with_context(|| format!("removing {}", path.display()))
+                    }
+                }
+            }
+        }
+        match fs::remove_dir(&dir) {
+            Ok(()) => {}
+
+            Err(error) => return Err(error).context("removing the Hush program folder"),
+        }
+        let _ = machine_state::delete("StartOnFirstLaunch");
+        let _ = machine_state::delete("LastScheduledRestart");
+        // This run still holds the lock; the file is opened with delete
+        // sharing, so Windows removes it when the handle closes at exit.
+        if let Ok(lock) = super::windows_setup_paths::setup_lock_path() {
+            let _ = fs::remove_file(lock);
+        }
+        if let Err(error) = hklm().delete_subkey_all(UNINSTALL_KEY) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                return Err(error).context("removing Installed apps entry");
+            }
+        }
+        out.line(if reboot {
+            "Hush was removed. Restart Windows to finish deleting the in-use files."
+        } else {
+            "Hush has been removed."
+        });
         if !quiet {
             message_box("Hush has been removed from this PC.");
         }
         Ok(())
+    }
+
+    fn schedule_removal(path: &Path) -> Result<()> {
+        use windows::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_DELAY_UNTIL_REBOOT};
+        let path = windows_core::HSTRING::from(path.as_os_str());
+        unsafe { MoveFileExW(&path, None, MOVEFILE_DELAY_UNTIL_REBOOT) }
+            .context("scheduling the in-use file for deletion")
     }
 
     fn message_box(text: &str) {
@@ -1484,7 +1588,10 @@ mod windows_main {
     }
 
     pub fn run() -> Result<()> {
-        let args: Vec<String> = std::env::args().skip(1).collect();
+        let args: Vec<String> = std::env::args_os()
+            .skip(1)
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
         let value_of = |flag: &str| {
             args.iter()
                 .position(|a| a == flag)
@@ -1492,10 +1599,7 @@ mod windows_main {
                 .cloned()
         };
         let has = |flag: &str| args.iter().any(|a| a == flag);
-        let out = Out {
-            log: value_of("--log").map(PathBuf::from),
-            mute: false,
-        };
+        let out = Out { mute: false };
         let command = args.first().map(String::as_str).unwrap_or("help");
         let needs_admin = matches!(
             command,
@@ -1505,6 +1609,23 @@ mod windows_main {
             let forwarded: Vec<String> = args.iter().filter(|a| !a.is_empty()).cloned().collect();
             return relaunch_elevated(&forwarded);
         }
+        let _guard = if needs_admin {
+            match setup_guard() {
+                Ok(guard) => Some(guard),
+                Err(error) => {
+                    if command == "repair" {
+                        record_repair_error(
+                            next_repair_generation(),
+                            has("--restart-audio"),
+                            &error,
+                        );
+                    }
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
         let restart = !has("--no-restart");
         let result = match command {
             "list" => list(),
@@ -1512,18 +1633,26 @@ mod windows_main {
             "install" => {
                 let mic = value_of("--mic").ok_or_else(|| anyhow!("install needs --mic <name>"))?;
                 let slot = value_of("--slot").unwrap_or_else(|| "efx".into());
-                install(&out, &mic, &slot, restart, has("--replace-mic"))
+                let position = match value_of("--desk-mic").as_deref() {
+                    Some("on") => Some(true),
+                    Some("off") => Some(false),
+                    None => None,
+                    Some(_) => bail!("--desk-mic expects on or off"),
+                };
+                install(&out, &mic, &slot, restart, has("--replace-mic"), position)
             }
-            "repair" => repair(&out, has("--restart-audio")),
+            "repair" => repair(&out, has("--restart-audio"), has("--scheduled")),
             "repair-task-status" => {
                 repair_task_status();
                 Ok(())
             }
-            "create-repair-tasks" => create_repair_tasks(&out).map(|()| {
-                out.line("Repair tasks created.");
-            }),
+            "create-repair-tasks" => prepare_settings(&out, None)
+                .and_then(|()| create_repair_tasks(&out))
+                .map(|()| {
+                    out.line("Repair tasks created.");
+                }),
             "uninstall" => uninstall(&out, restart, has("--purge")),
-            "uninstall-app" => uninstall_app(&out, has("--quiet")),
+            "uninstall-app" => uninstall_app(&out, has("--quiet"), has("--from-app")),
             _ => {
                 println!(
                     "usage: hush-setup list | status | install --mic <name> [--slot efx|lfx] | repair [--restart-audio] [--quiet] | repair-task-status | create-repair-tasks | uninstall [--purge] | uninstall-app [--quiet]"
@@ -1542,16 +1671,34 @@ mod windows_main {
         use super::*;
 
         fn rec(id: &str) -> RecMic {
-            RecMic { id: id.into(), slot: "efx".into(), label: None }
+            RecMic {
+                id: id.into(),
+                slot: "efx".into(),
+                label: None,
+                container: None,
+            }
         }
         fn snap(id: &str, name: &str, active: bool, has_hush: bool) -> Snap {
-            Snap { id: id.into(), name: name.into(), active, has_hush }
+            Snap {
+                id: id.into(),
+                name: name.into(),
+                active,
+                has_hush,
+                effect_conflict: false,
+                container: matches!(id, "old" | "new" | "n2").then(|| "same-usb-device".into()),
+            }
         }
 
         #[test]
         fn unchanged_when_active_with_hush() {
             let steps = plan_repair(&[rec("a")], &[snap("a", "Mic", true, true)]);
-            assert_eq!(steps, vec![Step::Ok { id: "a".into(), name: "Mic".into() }]);
+            assert_eq!(
+                steps,
+                vec![Step::Ok {
+                    id: "a".into(),
+                    name: "Mic".into()
+                }]
+            );
             assert!(!steps[0].changes());
             assert_eq!(summarize(&steps, false).0, "ok");
             assert_eq!(summarize(&steps, true).0, "restarted");
@@ -1583,10 +1730,22 @@ mod windows_main {
         #[test]
         fn waits_when_unplugged_or_deleted() {
             let steps = plan_repair(&[rec("old")], &[snap("old", "Mic", false, true)]);
-            assert_eq!(steps, vec![Step::Waiting { name: "Mic".into(), ambiguous: false }]);
-            assert_eq!(summarize(&steps, true), ("waiting", "Waiting for Mic.".to_string()));
+            assert_eq!(
+                steps,
+                vec![Step::Waiting {
+                    name: "Mic".into(),
+                    ambiguous: false
+                }]
+            );
+            assert_eq!(
+                summarize(&steps, true),
+                ("waiting", "Waiting for Mic.".to_string())
+            );
             // Key gone entirely: the recorded label still names it.
-            let labelled = RecMic { label: Some("Mic".into()), ..rec("gone") };
+            let labelled = RecMic {
+                label: Some("Mic".into()),
+                ..rec("gone")
+            };
             let steps = plan_repair(&[labelled], &[snap("x", "Webcam", true, false)]);
             assert!(matches!(&steps[0], Step::Waiting { name, .. } if name == "Mic"));
             // Nothing known about it at all.
@@ -1598,18 +1757,27 @@ mod windows_main {
         fn ambiguous_candidates_are_not_guessed() {
             let snaps = [
                 snap("old", "Mic", false, false),
-                snap("n1", "Mic", true, false),
+                Snap {
+                    container: Some("same-usb-device".into()),
+                    ..snap("n1", "Mic", true, false)
+                },
                 snap("n2", "Mic", true, false),
             ];
             let steps = plan_repair(&[rec("old")], &snaps);
-            assert_eq!(steps, vec![Step::Waiting { name: "Mic".into(), ambiguous: true }]);
+            assert_eq!(
+                steps,
+                vec![Step::Waiting {
+                    name: "Mic".into(),
+                    ambiguous: true
+                }]
+            );
             let (result, message) = summarize(&steps, false);
             assert_eq!(result, "waiting");
             assert!(message.contains("Several microphones"));
         }
 
         #[test]
-        fn candidate_already_holding_hush_is_preferred() {
+        fn matching_container_is_preferred() {
             let snaps = [
                 snap("old", "Mic", false, false),
                 snap("n1", "Mic", true, false),
@@ -1635,12 +1803,14 @@ mod windows_main {
         #[test]
         fn repair_file_roundtrip() {
             let report = RepairReport {
+                generation: 17,
+                operation: "repair".into(),
                 time_unix: 42,
                 result: "repaired".into(),
                 message: "Clean Mic restored on Mic = x.\nsecond".into(),
                 endpoint: "{0.0.1.00000000}.{abc}".into(),
             };
-            let parsed = parse_repair(&render_repair(&report)).unwrap();
+            let parsed = RepairReport::parse(&report.render()).unwrap();
             assert_eq!(parsed.time_unix, 42);
             assert_eq!(parsed.result, "repaired");
             assert_eq!(parsed.message, "Clean Mic restored on Mic = x. second");
@@ -1649,9 +1819,12 @@ mod windows_main {
 
         #[test]
         fn task_xml_has_required_settings() {
-            let xml = task_xml(r"C:\Program Files\Hush\hush-setup.exe", "repair --restart-audio --quiet");
+            let xml = task_xml(
+                r"C:\Program Files\Hush\hush-setup.exe",
+                "repair --restart-audio --quiet --scheduled",
+            );
             for needle in [
-                "<SecurityDescriptor>D:(A;;FA;;;BA)(A;;FA;;;SY)(A;;GRGX;;;AU)</SecurityDescriptor>",
+                "<SecurityDescriptor>D:(A;;FA;;;BA)(A;;FA;;;SY)(A;;GRGX;;;IU)</SecurityDescriptor>",
                 "<UserId>S-1-5-18</UserId>",
                 "<RunLevel>HighestAvailable</RunLevel>",
                 "<Triggers />",
@@ -1660,7 +1833,7 @@ mod windows_main {
                 "<ExecutionTimeLimit>PT2M</ExecutionTimeLimit>",
                 "<Hidden>true</Hidden>",
                 r#"<Command>"C:\Program Files\Hush\hush-setup.exe"</Command>"#,
-                "<Arguments>repair --restart-audio --quiet</Arguments>",
+                "<Arguments>repair --restart-audio --quiet --scheduled</Arguments>",
             ] {
                 assert!(xml.contains(needle), "missing {needle}");
             }

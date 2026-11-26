@@ -32,10 +32,31 @@ impl HushApp {
                     }
                     let mut chosen = self.selected_mic.clone();
                     egui::ComboBox::from_id_salt("mic")
-                        .selected_text(chosen.clone())
+                        .selected_text(self.selected_mic_name().unwrap_or("No microphone found"))
+                        .truncate()
                         .show_ui(ui, |ui| {
                             for mic in &self.mics {
-                                ui.selectable_value(&mut chosen, mic.clone(), mic);
+                                let same_name = self
+                                    .mics
+                                    .iter()
+                                    .filter(|other| other.name == mic.name)
+                                    .count()
+                                    > 1;
+                                let label = if same_name {
+                                    let suffix: String = mic
+                                        .id
+                                        .chars()
+                                        .rev()
+                                        .take(7)
+                                        .collect::<Vec<_>>()
+                                        .into_iter()
+                                        .rev()
+                                        .collect();
+                                    format!("{} · {suffix}", mic.name)
+                                } else {
+                                    mic.name.clone()
+                                };
+                                ui.selectable_value(&mut chosen, mic.id.clone(), label);
                             }
                         });
                     if chosen != self.selected_mic {
@@ -81,9 +102,24 @@ impl HushApp {
                         if theme::destructive_button(ui, "Remove").clicked() {
                             self.run_setup(vec!["uninstall".into()]);
                         }
-                    } else if theme::primary_button(ui, "Install").clicked() {
-                        let args =
-                            vec!["install".into(), "--mic".into(), self.selected_mic.clone()];
+                    } else if self.selected_mic.is_empty() {
+                        ui.add_enabled(false, egui::Button::new("Install"));
+                    } else if theme::primary_button(
+                        ui,
+                        if self.state.capture_ids.is_empty() {
+                            "Install"
+                        } else {
+                            "Switch Clean Mic"
+                        },
+                    )
+                    .clicked()
+                    {
+                        let args = vec![
+                            "install".into(),
+                            "--mic".into(),
+                            self.selected_mic.clone(),
+                            "--replace-mic".into(),
+                        ];
                         self.run_setup(args);
                     }
                 },
@@ -94,6 +130,18 @@ impl HushApp {
         });
         if refresh {
             self.refresh_mics();
+        }
+        if let Some(name) = self.selected_mic_name() {
+            if theme::outline_button(ui, "Copy device name").clicked() {
+                self.setup_clipboard_note = Some(if crate::clipboard::copy(name) {
+                    "Device name copied."
+                } else {
+                    "Could not open the clipboard."
+                });
+            }
+        }
+        if let Some(note) = self.setup_clipboard_note {
+            theme::hint(ui, note);
         }
         if let Some(warning) = self.level_warning {
             ui.add_space(12.0);
@@ -127,7 +175,7 @@ impl HushApp {
                 ui,
                 &format!(
                     "In Discord and games, select \"{}\" directly, not another app's virtual microphone (such as SteelSeries Sonar), or your voice will be processed twice.",
-                    if self.selected_mic.is_empty() { "your microphone" } else { &self.selected_mic }
+                    self.selected_mic_name().unwrap_or("your microphone")
                 ),
             );
             theme::hint(

@@ -25,18 +25,21 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2
         with:
           key: release
 
       - name: Build application and APO payloads
-        run: cargo build --release --workspace --exclude hush-installer
+        run: |
+          cargo build --locked --release -p hush --bin hush --bin hush-setup
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo build --locked --release -p hush-apo
 
       - name: Build installer
         env:
           SM_PAYLOAD_DIR: ${{ github.workspace }}\target\release
-        run: cargo build --release -p hush-installer
+        run: cargo build --locked --release -p hush-installer
 
       # --release reuses the optimized build script, so the payload is not
       # recompressed by an unoptimized brotli.
@@ -45,14 +48,14 @@ jobs:
           SM_PAYLOAD_DIR: ${{ github.workspace }}\target\release
           # The installer's manifest asks for elevation; the test exe must not.
           __COMPAT_LAYER: RunAsInvoker
-        run: cargo test --release -p hush-installer
+        run: cargo test --locked --release -p hush-installer
 
   test:
     runs-on: windows-latest
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.0
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
@@ -60,7 +63,7 @@ jobs:
           key: test
 
       - name: Test workspace
-        run: cargo test --workspace --exclude hush-installer --all-targets
+        run: cargo test --locked --workspace --exclude hush-installer --all-targets
 
       - name: Clippy
-        run: cargo clippy --workspace --exclude hush-installer --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --exclude hush-installer --all-targets -- -D warnings

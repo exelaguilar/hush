@@ -1,6 +1,6 @@
 ﻿[package]
 name = "hush-apo"
-version = "1.2.0"
+version = "1.2.1"
 edition = "2021"
 description = "Hush clean-mic Audio Processing Object (loaded by Windows' audio engine)"
 authors = ["Exel (https://exel.dev)"]
@@ -12,6 +12,10 @@ name = "hush_apo"
 # cdylib: the DLL audiodg.exe loads. rlib: lets the app and tests reuse the DSP
 # chain and the settings format.
 crate-type = ["cdylib", "rlib"]
+
+[features]
+offline-experiments = []
+experimental-startup-watchdog = []
 
 [dependencies]
 deep_filter = { git = "https://github.com/Rikorose/DeepFilterNet", tag = "v0.5.6", default-features = false, features = ["tract", "default-model"] }

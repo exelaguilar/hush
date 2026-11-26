@@ -180,8 +180,16 @@ fn flag(value: &str) -> Option<bool> {
 }
 
 pub fn load() -> Prefs {
+    try_load().unwrap_or_default()
+}
+
+pub fn try_load() -> std::io::Result<Prefs> {
     let mut prefs = Prefs::default();
-    let text = std::fs::read_to_string(path()).unwrap_or_default();
+    let text = match hush_apo::settings::read_config(&path()) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(prefs),
+        Err(error) => return Err(error),
+    };
     for line in text.lines() {
         let Some((key, value)) = line.split_once('=') else {
             continue;
@@ -196,16 +204,14 @@ pub fn load() -> Prefs {
             "notifications" => prefs.notifications = flag(value).unwrap_or(prefs.notifications),
             "mute_key" => prefs.mute_key = MuteKey::from_id(value).unwrap_or(prefs.mute_key),
             "window" => prefs.window = WindowRect::from_id(value),
-            "clean_mic_hotkey" => {
-                prefs.toggle_hotkey = flag(value).unwrap_or(prefs.toggle_hotkey)
-            }
+            "clean_mic_hotkey" => prefs.toggle_hotkey = flag(value).unwrap_or(prefs.toggle_hotkey),
             "clean_mic_key" => {
                 prefs.toggle_key = MuteKey::from_id(value).unwrap_or(prefs.toggle_key)
             }
             _ => {}
         }
     }
-    prefs
+    Ok(prefs)
 }
 
 pub fn save(prefs: &Prefs) -> std::io::Result<()> {
@@ -231,10 +237,48 @@ pub fn save(prefs: &Prefs) -> std::io::Result<()> {
     if let Some(window) = prefs.window {
         text.push_str(&format!("window = {}\n", window.id()));
     }
-    std::fs::write(path, text)
+    hush_apo::settings::write_atomic(&path, &text)
 }
 
-/// True if Hush starts at sign-in for this user.
+pub fn initialize_startup() {
+    if !crate::notify::running_installed() {
+        return;
+    }
+    let user = RegKey::predef(HKEY_CURRENT_USER);
+    let Ok((key, _)) = user.create_subkey(r"Software\Exel\Hush") else {
+        return;
+    };
+    if key.get_value::<u32, _>("StartupInitialized").is_ok() {
+        return;
+    }
+    // Preserve existing per-user decisions on upgrade.
+    let existing = start_with_windows()
+        || user
+            .open_subkey(r"Software\Classes\AppUserModelId\Exel.Hush")
+            .is_ok();
+    if !existing
+        && hush::machine_state::read("StartOnFirstLaunch").is_ok_and(|value| value == "1")
+        && set_start_with_windows(true).is_err()
+    {
+        return;
+    }
+    let _ = key.set_value("StartupInitialized", &1_u32);
+}
+
+pub fn cleanup_install() {
+    let _ = set_start_with_windows(false);
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    for key in [
+        r"Software\Classes\hush",
+        r"Software\Classes\AppUserModelId\Exel.Hush",
+        r"Software\Exel\Hush",
+    ] {
+        let _ = hkcu.delete_subkey_all(key);
+    }
+    let _ = std::fs::remove_dir_all(dir());
+}
+
+/// True if Hush registered a sign-in request for this user.
 pub fn start_with_windows() -> bool {
     RegKey::predef(HKEY_CURRENT_USER)
         .open_subkey_with_flags(RUN_KEY, KEY_READ)

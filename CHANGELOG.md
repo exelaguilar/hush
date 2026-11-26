@@ -1,5 +1,41 @@
 # Changelog
 
+## 1.2.1
+
+**Fixes**
+- The status badge shows the apps using your microphone again, for
+  example *Active · Apex Legends, Discord*. Hover it to see every app.
+- Text in the Hush window can be selected and copied with Ctrl+C.
+- *Hold to hear original* no longer rewrites your settings file. It goes
+  back to normal by itself if the window stops responding.
+- Changing a setting from the tray or a hotkey while the window is saving
+  no longer fails with *Could not change Clean Mic*.
+- *Mic Test* and the mute hotkey use the exact microphone you picked, even
+  when two microphones have the same name. Stopping a test keeps your
+  last take and releases the microphone.
+- Automatic repair waits for another Hush setup or repair to finish
+  instead of failing after two minutes with *The repair did not finish in
+  time*.
+- The tray app no longer quits silently if it restarts right after closing.
+- The header shows *Processing degraded* when Clean Mic had to fall back to
+  your unprocessed microphone, and the health watch waits again after
+  sleep.
+
+**Safer setup**
+- The install record and repair results live in a protected machine
+  location, and the repair tasks check where they run from.
+- Installs and upgrades put back the previous program files if copying
+  fails, and the installer writes a log to `%ProgramFiles%\Hush\install.log`.
+- Uninstalling from *Installed apps* waits for removal and tells you when
+  it is done. It also removes the setup lock file.
+
+**Behind the scenes**
+- Releases check the sound byte for byte against 1.2.0, verify that the
+  installer contains the exact binaries just built, and can safely be
+  re-run.
+
+The sound is unchanged from 1.2.0.
+
 ## 1.2.0
 
 **New**

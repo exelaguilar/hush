@@ -255,14 +255,29 @@ pub fn row_sized<R>(
     control: impl FnOnce(&mut Ui) -> R,
 ) -> R {
     let p = palette(ui);
+    let label = |ui: &mut Ui| {
+        ui.label(RichText::new(title).family(semibold()));
+        if !description.is_empty() {
+            ui.label(RichText::new(description).color(p.muted_foreground).small());
+        }
+    };
+    if ui.available_width() < control_width + 162.0 {
+        label(ui);
+        ui.add_space(4.0);
+        let size = egui::vec2(ui.available_width(), ui.spacing().interact_size.y);
+        return ui
+            .allocate_ui_with_layout(
+                size,
+                egui::Layout::right_to_left(egui::Align::Center),
+                control,
+            )
+            .inner;
+    }
     ui.horizontal(|ui| {
-        let text_width = (ui.available_width() - control_width - 12.0).max(150.0);
+        let text_width = ui.available_width() - control_width - 12.0;
         ui.vertical(|ui| {
             ui.set_width(text_width);
-            ui.label(RichText::new(title).family(semibold()));
-            if !description.is_empty() {
-                ui.label(RichText::new(description).color(p.muted_foreground).small());
-            }
+            label(ui);
         });
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), control)
             .inner
@@ -296,8 +311,17 @@ pub fn switch(ui: &mut Ui, on: &mut bool, label: &str) -> Response {
         track.gamma_multiply(0.5)
     };
     let radius = rect.height() / 2.0;
-    ui.painter()
-        .rect(rect, radius, track, Stroke::NONE, StrokeKind::Inside);
+    ui.painter().rect(
+        rect,
+        radius,
+        track,
+        if enabled && !*on {
+            Stroke::new(1.0, p.muted_foreground)
+        } else {
+            Stroke::NONE
+        },
+        StrokeKind::Inside,
+    );
     let knob_x = egui::lerp((rect.left() + radius)..=(rect.right() - radius), t);
     let knob = if ui.visuals().dark_mode && !*on {
         p.foreground.gamma_multiply(0.9)
@@ -379,7 +403,7 @@ pub fn destructive_button(ui: &mut Ui, text: &str) -> Response {
 }
 
 /// Small pill with a coloured dot, e.g. "● Running".
-pub fn badge(ui: &mut Ui, color: Color32, text: &str) {
+pub fn badge(ui: &mut Ui, color: Color32, text: &str) -> egui::Response {
     let p = palette(ui);
     egui::Frame::new()
         .fill(
@@ -395,7 +419,8 @@ pub fn badge(ui: &mut Ui, color: Color32, text: &str) {
                 ui.painter().circle_filled(dot.center(), 3.5, color);
                 ui.label(RichText::new(text).small().family(semibold()));
             });
-        });
+        })
+        .response
 }
 
 /// Muted helper text.

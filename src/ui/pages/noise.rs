@@ -17,7 +17,7 @@ impl HushApp {
             match live {
                 None => theme::hint(
                     ui,
-                    "No app is using your microphone right now. Join a Discord call, or use Mic Test, to see the meters.",
+                    if self.health.agent.apps.is_empty() { "No live levels. Open Mic Test or start capture in another app." } else { "An app is using the microphone. Clean Mic has no live levels for it yet." },
                 ),
                 Some(levels) => {
                     let meter = |ui: &mut egui::Ui, label: &str, value: f32| {

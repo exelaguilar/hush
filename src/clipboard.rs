@@ -1,7 +1,8 @@
 //! Copies text to the Windows clipboard.
 //!
 //! eframe is built without its clipboard feature (it would pull in a
-//! clipboard crate), so `egui::Context::copy_text` does nothing here.
+//! clipboard crate), so egui's own copy goes nowhere. [`SystemClipboard`]
+//! hands it to Windows instead.
 
 use windows::Win32::{
     Foundation::{GlobalFree, HANDLE, HGLOBAL},
@@ -12,6 +13,26 @@ use windows::Win32::{
 };
 
 const CF_UNICODETEXT: u32 = 13;
+
+/// Sends egui's copy commands (Ctrl+C on selected text) to the Windows
+/// clipboard. Runs on each frame's final output.
+pub struct SystemClipboard;
+
+impl eframe::egui::Plugin for SystemClipboard {
+    fn debug_name(&self) -> &'static str {
+        "hush-clipboard"
+    }
+
+    fn output_hook(&mut self, _ctx: &eframe::egui::Context, output: &mut eframe::egui::FullOutput) {
+        output.platform_output.commands.retain(|command| match command {
+            eframe::egui::OutputCommand::CopyText(text) => {
+                copy(text);
+                false
+            }
+            _ => true,
+        });
+    }
+}
 
 /// Puts `text` on the clipboard. Returns false if Windows refused.
 pub fn copy(text: &str) -> bool {

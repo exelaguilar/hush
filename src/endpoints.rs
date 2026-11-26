@@ -10,11 +10,6 @@ use winreg::{
 };
 
 const MMDEVICES: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio";
-const PKEY_NAME: &str = "{a45c254e-df1c-4efd-8020-67d146a850e0},2";
-const PKEY_DESCRIPTION: &str = "{b3f8fa53-0004-438e-9003-51a46e139bfc},6";
-/// 1 = "Audio enhancements" disabled: Windows then skips every APO.
-const PKEY_DISABLE_SYSFX: &str = "{1da5d803-d492-4edd-8c23-e0c0ffee7f0e},5";
-const FX: &str = "{d04e05a6-594b-4fb6-a80d-01af5eed7d1d}";
 /// `DeviceState` value of a plugged-in endpoint.
 const STATE_ACTIVE: u32 = 1;
 
@@ -24,6 +19,8 @@ pub struct Endpoint {
     pub id: String,
     /// Friendly name, e.g. "Microphone (USB Audio)"; the id if unknown.
     pub name: String,
+    pub container: Option<String>,
+    pub effect_conflict: bool,
     pub active: bool,
     /// Hush's plugin is registered on this endpoint. Only checked for
     /// active endpoints.
@@ -38,13 +35,7 @@ pub fn endpoint_name(flow: &str, id: &str) -> Option<String> {
     let props = RegKey::predef(HKEY_LOCAL_MACHINE)
         .open_subkey_with_flags(format!(r"{MMDEVICES}\{flow}\{id}\Properties"), KEY_READ)
         .ok()?;
-    let short: String = props.get_value(PKEY_NAME).ok()?;
-    let description: String = props.get_value(PKEY_DESCRIPTION).unwrap_or_default();
-    Some(if description.is_empty() {
-        short
-    } else {
-        format!("{short} ({description})")
-    })
+    hush::device_registry::label(&props)
 }
 
 /// Friendly names compare ignoring case and surrounding spaces.
@@ -55,25 +46,6 @@ pub fn names_match(a: &str, b: &str) -> bool {
 /// Full MMDevice id of a capture endpoint: "{0.0.1.00000000}.{guid}".
 pub fn full_device_id(id: &str) -> String {
     format!("{{0.0.1.00000000}}.{id}")
-}
-
-fn hush_attached(root: &RegKey, id: &str) -> bool {
-    let Ok(key) = root.open_subkey_with_flags(format!(r"{id}\FxProperties"), KEY_READ) else {
-        return false;
-    };
-    [1, 2, 7].into_iter().any(|slot| {
-        key.get_value::<String, _>(format!("{FX},{slot}"))
-            .is_ok_and(|v| v.eq_ignore_ascii_case(hush_apo::CLSID_STRING))
-    })
-}
-
-/// The switch lives in Properties on most builds and in FxProperties on some.
-fn enhancements_disabled(root: &RegKey, id: &str) -> bool {
-    ["Properties", "FxProperties"].into_iter().any(|sub| {
-        root.open_subkey_with_flags(format!(r"{id}\{sub}"), KEY_READ)
-            .and_then(|key| key.get_value::<u32, _>(PKEY_DISABLE_SYSFX))
-            .is_ok_and(|v| v == 1)
-    })
 }
 
 /// Every capture endpoint Windows knows, plugged in or not.
@@ -91,9 +63,27 @@ pub fn capture_endpoints() -> Vec<Endpoint> {
                 .and_then(|key| key.get_value::<u32, _>("DeviceState"))
                 .is_ok_and(|state| state == STATE_ACTIVE);
             let name = endpoint_name("Capture", &id).unwrap_or_else(|| id.clone());
+            let endpoint = root.open_subkey_with_flags(&id, KEY_READ).ok();
+            use hush::device_registry::Effect;
+            let effect = endpoint
+                .as_ref()
+                .filter(|_| active)
+                .map(hush::device_registry::effect);
+            let has_hush = effect == Some(Effect::Ready);
+            let effect_conflict = matches!(effect, Some(Effect::Conflict | Effect::Foreign));
+            let container = endpoint
+                .as_ref()
+                .and_then(|key| key.open_subkey_with_flags("Properties", KEY_READ).ok())
+                .as_ref()
+                .and_then(hush::device_registry::container);
             Endpoint {
-                has_hush: active && hush_attached(&root, &id),
-                enhancements_off: active && enhancements_disabled(&root, &id),
+                has_hush,
+                effect_conflict,
+                container,
+                enhancements_off: active
+                    && endpoint
+                        .as_ref()
+                        .is_some_and(hush::device_registry::enhancements_disabled),
                 id,
                 name,
                 active,
@@ -102,11 +92,19 @@ pub fn capture_endpoints() -> Vec<Endpoint> {
         .collect()
 }
 
-/// Plugged-in capture endpoints whose friendly name is `name`.
-pub fn find_active(name: &str) -> Vec<Endpoint> {
+/// Plugged-in physical capture endpoints.
+pub fn physical_microphones() -> Vec<Endpoint> {
+    use hush::virtual_output::{
+        is_hush_virtual_input, is_hush_virtual_output, is_third_party_virtual_endpoint,
+    };
     capture_endpoints()
         .into_iter()
-        .filter(|endpoint| endpoint.active && names_match(&endpoint.name, name))
+        .filter(|e| {
+            e.active
+                && !is_hush_virtual_input(&e.name)
+                && !is_hush_virtual_output(&e.name)
+                && !is_third_party_virtual_endpoint(&e.name)
+        })
         .collect()
 }
 
