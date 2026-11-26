@@ -16,7 +16,7 @@ The app and plugin share settings under `%ProgramData%\Hush` and engine status u
   older and newer settings files load safely.
 - In the runtime directory, `status.txt` is a heartbeat the plugin writes once a second while audio
   flows (every 30 s otherwise). It includes `cpu_permille`, Clean Mic's own
-  estimated load over the last second in tenths of a percent of one core: the
+  estimated load averaged over the last 10 seconds in tenths of a percent of one core: the
   denoiser thread's CPU time (`GetThreadTimes`, read by the thread itself
   twice a second) plus the time spent in the audio callback. The plugin's
   helper thread wakes 20 times a second while audio flows and 4 times a

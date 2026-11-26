@@ -17,7 +17,7 @@ pub struct InstallState {
     /// Late frames (short audio gaps) reported by the APO since it started.
     pub glitches: u64,
     /// Clean Mic's own CPU use while processing, in tenths of a percent of
-    /// one core (as the plugin measured it over the last second).
+    /// one core (averaged by the plugin over the last 10 seconds).
     pub cpu_permille: Option<u32>,
     record: Option<String>,
 }

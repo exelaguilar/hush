@@ -57,7 +57,7 @@ App preferences such as startup, tray, mute hotkey and notifications live in
 
 | | |
 | --- | --- |
-| CPU | About 3% of one core for the audio processing. Measured live by the plugin on the developer's PC during a Discord call: 0.8% to 3.4% of one core. **About → Status** shows the figure for your PC. The tray app adds well under 0.1% while idle. |
+| CPU | About 3% to 5% of one core for the audio processing. Measured live by the plugin on the developer's PC: 0.8% to 3.4% of one core during a Discord call, and an average of about 5% (single seconds from 1.8% to 9.6%) on another day. **About → Status** shows the figure for your PC, averaged over the last 10 seconds. The tray app adds well under 0.1% while idle. |
 | Added delay | About 75 ms, calculated from the model's look-ahead plus a 20 ms safety buffer. Not measured end to end. |
 | Memory | The tray app uses about 3 MB. The window adds about 80 MB, mostly the graphics driver, only while it is open. The neural model loads inside `audiodg.exe` while a stream is open. |
 | Network | None. The only network call is **Check for updates**, which runs only when you click it. |

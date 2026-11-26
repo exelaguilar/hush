@@ -603,7 +603,7 @@ pub struct EngineStatus {
     pub underruns: u64,
     /// Samples skipped to keep latency bounded.
     pub skipped: u64,
-    /// Clean Mic's own CPU use over the last second, in tenths of a percent
+    /// Clean Mic's own CPU use over the last 10 seconds, in tenths of a percent
     /// of one core (denoiser thread plus audio callback).
     pub cpu_permille: Option<u32>,
 }
@@ -658,23 +658,50 @@ pub fn record_callback_time(elapsed: Duration) {
     CALLBACK_NS.fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
 }
 
-/// Turns two readings of the CPU counters into a load figure.
+/// Seconds of readings the reported load is averaged over. Windows counts
+/// thread time in ~15.6 ms steps, so a one-second figure jumps around.
+const CPU_WINDOW: usize = 10;
+
+/// Turns readings of the CPU counters into a load figure averaged over the
+/// last `CPU_WINDOW` readings. A fixed ring: no allocation.
 struct CpuMeter {
-    last: Option<(Instant, u64)>,
+    readings: [(Instant, u64); CPU_WINDOW + 1],
+    len: usize,
+    next: usize,
 }
 
 impl CpuMeter {
-    /// Tenths of a percent of one core since the previous call.
+    fn new() -> Self {
+        let now = Instant::now();
+        Self {
+            readings: [(now, 0); CPU_WINDOW + 1],
+            len: 0,
+            next: 0,
+        }
+    }
+
+    /// Tenths of a percent of one core, averaged over the recent readings.
     fn sample(&mut self, now: Instant) -> Option<u32> {
         let total = WORKER_CPU_NS.load(Ordering::Relaxed) + CALLBACK_NS.load(Ordering::Relaxed);
         self.sample_total(now, total)
     }
 
     fn sample_total(&mut self, now: Instant, total: u64) -> Option<u32> {
-        let previous = self.last.replace((now, total));
-        let (at, before) = previous?;
+        self.readings[self.next] = (now, total);
+        self.next = (self.next + 1) % self.readings.len();
+        self.len = (self.len + 1).min(self.readings.len());
+        if self.len < 2 {
+            return None;
+        }
+        let oldest = (self.next + self.readings.len() - self.len) % self.readings.len();
+        let (at, before) = self.readings[oldest];
         let wall = now.duration_since(at).as_nanos() as u64;
         (wall > 0).then(|| (total.saturating_sub(before) * 1000 / wall) as u32)
+    }
+
+    /// Forgets old readings, so a pause does not dilute the next figure.
+    fn restart(&mut self) {
+        self.len = 0;
     }
 }
 
@@ -762,7 +789,7 @@ pub fn start_watcher() {
                 let (mut next_settings, mut next_status) = (now, now);
                 let mut next_heartbeat = now + HEARTBEAT;
                 let mut idle_since: Option<Instant> = None;
-                let mut cpu = CpuMeter { last: None };
+                let mut cpu = CpuMeter::new();
                 let mut was_flowing = false;
                 loop {
                     // While audio flows: live meter at 20 Hz. With no audio
@@ -804,7 +831,10 @@ pub fn start_watcher() {
                     if now >= next_status {
                         next_status = now + STATUS_TICK;
                         let flowing = frames != last_frames;
-                        // Measured over the last second while audio flows.
+                        // Averaged over the last 10 s while audio flows.
+                        if !flowing {
+                            cpu.restart();
+                        }
                         let load = cpu.sample(now).filter(|_| flowing);
                         if flowing || was_flowing != flowing || now >= next_heartbeat {
                             last_frames = frames;
@@ -1167,12 +1197,53 @@ mod tests {
 
     #[test]
     fn cpu_meter_reports_tenths_of_a_percent() {
-        let mut meter = CpuMeter { last: None };
+        let mut meter = CpuMeter::new();
         let start = Instant::now();
         assert_eq!(meter.sample_total(start, 1_000), None);
         // 25 ms of CPU over one second is 2.5% of a core.
         let load = meter.sample_total(start + Duration::from_secs(1), 1_000 + 25_000_000);
         assert_eq!(load, Some(25));
+    }
+
+    #[test]
+    fn cpu_meter_averages_over_ten_seconds() {
+        let mut meter = CpuMeter::new();
+        let start = Instant::now();
+        let mut total = 0;
+        meter.sample_total(start, total);
+        // Nine quiet seconds at 1.5%, then one 15.6 ms-step spike to 12.5%.
+        for second in 1..=9 {
+            total += 15_000_000;
+            meter.sample_total(start + Duration::from_secs(second), total);
+        }
+        total += 125_000_000;
+        let load = meter.sample_total(start + Duration::from_secs(10), total);
+        assert_eq!(load, Some(26));
+        // Older readings drop out: ten more seconds at 1.5% read 1.5%.
+        for second in 11..=20 {
+            total += 15_000_000;
+            meter.sample_total(start + Duration::from_secs(second), total);
+        }
+        assert_eq!(
+            meter.sample_total(start + Duration::from_secs(21), total + 15_000_000),
+            Some(15)
+        );
+    }
+
+    #[test]
+    fn cpu_meter_restart_forgets_the_pause() {
+        let mut meter = CpuMeter::new();
+        let start = Instant::now();
+        meter.sample_total(start, 0);
+        meter.sample_total(start + Duration::from_secs(1), 30_000_000);
+        meter.restart();
+        // A long pause with no CPU, then one second at 3%.
+        assert_eq!(
+            meter.sample_total(start + Duration::from_secs(60), 30_000_000),
+            None
+        );
+        let load = meter.sample_total(start + Duration::from_secs(61), 60_000_000);
+        assert_eq!(load, Some(30));
     }
 
     #[test]

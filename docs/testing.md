@@ -65,7 +65,7 @@ PCM from the candidate and the 1.2.0 APO on the same machine using
 
 | Area | Tests | Examples |
 | --- | --- | --- |
-| Audio plugin | 50 | Noise and click removal; a single click never opens the gate; soft word endings keep it open; limiter never exceeds its ceiling; other sample rates; real-time worker pacing; stream start without a fast-forward; watchdog and panic fallback; settings that survive garbage and read failures; concurrent settings edits wait instead of failing |
+| Audio plugin | 52 | Noise and click removal; a single click never opens the gate; soft word endings keep it open; limiter never exceeds its ceiling; other sample rates; real-time worker pacing; stream start without a fast-forward; watchdog and panic fallback; settings that survive garbage and read failures; concurrent settings edits wait instead of failing; the CPU figure averages 10 s and forgets pauses |
 | COM integration | 3 | Recreates how Windows' audio engine creates and aggregates the plugin |
 | App | 45 | Health watch decisions and rate limits; agent state file; window position; app display names; level warnings; diagnostics; settings import validation; version comparison; notification XML; setup lock and named events wait out a previous holder |
 | Setup tool | 9 | Repair planning: an unplugged mic, a mic back under a new ID, two mics with the same name; install record and repair task XML |

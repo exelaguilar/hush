@@ -10,6 +10,8 @@
   back to normal by itself if the window stops responding.
 - Changing a setting from the tray or a hotkey while the window is saving
   no longer fails with *Could not change Clean Mic*.
+- **About → Status** shows Clean Mic's CPU load averaged over the last
+  10 seconds, so it no longer jumps between readings.
 - *Mic Test* and the mute hotkey use the exact microphone you picked, even
   when two microphones have the same name. Stopping a test keeps your
   last take and releases the microphone.
